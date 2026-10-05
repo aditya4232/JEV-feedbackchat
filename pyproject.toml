@@ -1,0 +1,69 @@
+[project]
+name = "jev-feedbackchat"
+version = "0.1.0"
+description = "Jev-driven feedback middleware: classifies every user and assistant message, produces structured feedback, and adapts the agent's effective prompt via named deterministic policies."
+authors = [
+    { name = "Aditya Shenvi" }
+]
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = [
+    # Core is intentionally dependency-free: the live Jev adapter imports
+    # typesafe_sdk lazily behind the `live` extra.
+]
+
+[project.optional-dependencies]
+# Real Jev integration. Pinned to a known-good range for the System One API.
+live = [
+    "typesafe-sdk>=0.7.2",
+]
+
+[dependency-groups]
+# Synced by default by `uv sync` / `uv run`, unlike optional-dependencies.
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+    # The live-adapter unit tests use a fake SDK client but still construct
+    # real Noul question objects, so the SDK must be importable in dev.
+    "typesafe-sdk>=0.7.2",
+]
+
+[project.scripts]
+jevloop = "jevloop.cli:main"
+jevloop-eval = "evaluation.run_eval:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jevloop", "evaluation"]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "live: requires TYPESAFE_API_KEY and counts against the live budget",
+]

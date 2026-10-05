@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+.env
+.env.local
+*.log
+*.tmp
+.pyright_cache/
+# uv-managed env files
+.venv/
+uv.lock.local
+# Live evaluation artifacts (committed summaries only; raw responses live here)
+live_eval/
+transcripts/live/
+# Eval reports are regenerable; README shows a captured sample
+evaluation/results/*.json
