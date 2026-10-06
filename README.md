@@ -1,324 +1,205 @@
-# jev-feedbackchat
+# JEV feedback middleware
 
-**Built by Aditya Shenvi.**
+**Built by Aditya Shenvi.** This repository implements a small, reusable
+middleware loop that classifies complete chat messages, turns those decisions
+into explicit feedback, and adapts the effective instructions passed to an
+agent generator.
 
-A small middleware layer for an agent chat loop. Every user message *and*
-every assistant response gets classified with [Jev](https://typesafe.ai),
-the classifications turn into structured feedback, and a deterministic
-policy turns that feedback into concrete additions to the *next* system
-prompt. Nothing is rewritten by a model, every change is named and
-versioned, and the exact prompt the generator saw is recorded.
+## Interview requirements and implementation choices
 
-This repo is my submission for the assignment: classify every user input
-and AI response with Jev, keep the categories extensible (happy, sad,
-deception, cunning, …), feed the classification back into the agent system
-so prompts are rephrased, and submit through a Git repository. No
-deployment is involved.
+The reported interview requirements are:
 
-**Jump to:** [Quick start](#quick-start-5-minutes) ·
-[How the loop works](#how-the-loop-works) ·
-[Repo map](#repo-map) ·
-[Evaluation](#e-evaluation) ·
-[Host integration](#f-using-this-with-a-plugin-based-agent-host) ·
-[Status](#g-reproducibility-and-status)
+1. Use Jev to classify every user input and AI response.
+2. Support extensible categories, including happy, sad, deception and cunning.
+3. Send classifications back to the agent system so its effective prompt can
+   be rephrased.
+4. Submit the implementation through a Git repository.
 
----
+The core path for these requirements is the live `LiveJevClassifier`, the
+configurable category taxonomy, and `FeedbackLoop`. Live Jev use requires
+`TYPESAFE_API_KEY`; without it, the CLI must be run in explicit offline mode,
+which is a deterministic mock and does not verify Jev semantics.
 
-## Quick start (5 minutes)
+The Python library, CLI, small single-annotator evaluation set, and optional
+provider adapters are implementation choices. FastAPI, SQLite, a review UI,
+and a native Bahulam plugin wrapper are not interview requirements and are
+not part of this core implementation. No deployment is required.
 
-You need Python 3.10+ and [uv](https://docs.astral.sh/uv/). No API key is
-required for any of this — the live SDK is installed, but the demo uses
-the labelled offline mock unless you ask for `--mode live`.
+## Five-minute local demonstration
 
-```bash
-uv sync --extra live      # core has no runtime deps; dev tools + Jev SDK
-uv run jevloop            # four-turn demo conversation, offline mock
-uv run pytest -q          # 45 passed, 1 skipped (live smoke test, no key)
+On Windows PowerShell, run:
+
+```powershell
+./examples/five_minute_demo.ps1
 ```
 
-Or let the script do all of it, including both evaluation modes:
+The script installs locked dependencies, runs a four-turn conversation with
+the explicitly labelled offline classifier and mock generator, runs tests,
+and prints separate mock and keyword-baseline evaluations. The demo includes
+an assistant response whose classification adds `keep_assistant_honest` to
+the next turn's effective system prompt. The generator reports that it
+received the adapted prompt. These fixed fixtures demonstrate orchestration,
+not semantic classification quality.
 
-```bash
-bash examples/five_minute_demo.sh
+On a Unix shell, the equivalent is `bash examples/five_minute_demo.sh`.
+For individual commands:
+
+```powershell
+uv sync --frozen --extra live
+uv run jevloop --mode offline --generator-mode mock
+uv run pytest -q                 # excludes live-marked tests, even with a key set
+uv run ruff check src evaluation tests
+uv run mypy src evaluation
+uv run jevloop-eval --mode offline
+uv run jevloop-eval --mode baseline
 ```
 
-The demo runs a four-turn support conversation and writes
-`transcripts/demo.jsonl`, so you can replay exactly what happened. Between
-them, the turns exercise every default rule and both feedback directions:
-
-1. a grateful request → `acknowledge_positive` added;
-2. a request that tries to get the assistant to lie →
-   `escalate_deception_suspect` **and** `handle_cunning_request` added; the
-   echoed reply itself flags deception and is deliberately left unrevised, so
-   it stays flagged;
-3. a plain follow-up → the prompt picks up `keep_assistant_honest` from
-   turn 2's *response* classification (response feedback changing the next
-   generation);
-4. a distress signal → `acknowledge_distress` added, the flagged reply is
-   classified, and a revision is requested and recorded.
-
-### Live mode
-
-```bash
-cp .env.example .env             # then put TYPESAFE_API_KEY in it
-set -a; source .env; set +a      # or: export TYPESAFE_API_KEY=...
-uv run jevloop --mode live       # real Jev classification
-```
-
-Then, within a bounded budget:
-
-```bash
-uv run pytest -m live -x                              # small live smoke test
-uv run jevloop-eval --mode live --max-calls 42        # scored live evaluation
-```
-
----
+The CLI writes its transcript to ignored `transcripts/run.jsonl` by default.
+The checked-in `transcripts/demo.jsonl` is a sample from the offline/mock
+demo, not a Jev run. The active classifier and generator modes are printed;
+`offline` is never described as Jev.
 
 ## How the loop works
 
-```
-                        ┌──────────────────────────────────────────┐
-                        │            YOUR AGENT HOST               │
-                        │    (any chat loop / orchestrator)        │
-                        └──────────────────────────────────────────┘
-                                        ▲                 │
-        user message in                 │                 ▼
-   ─────────────────────────────────────┤         assistant out
-                                        │                 │
-                        ┌───────────────┴─────────────────▼───────┐
-                        │          jev-feedbackchat core          │
-                        │   classify(user) -> adapt(prompt)       │
-                        │   classify(assistant) -> response       │
-                        │   feedback -> next generation           │
-                        └─────────────────────────────────────────┘
+```text
+complete user message + bounded history
+  -> Jev classifies each configured proposition independently
+  -> structured score / decision / abstention
+  -> named, versioned deterministic prompt policy
+  -> generator receives exact effective system prompt + original request
+  -> complete assistant response is classified
+  -> assistant classification changes the next generation's prompt
 ```
 
-`FeedbackLoop.run_turn(user_text, generator)` does eight things:
+`FeedbackLoop.run_turn` owns one turn. `tests/test_loop.py::
+test_response_feedback_updates_next_prompt` uses a scripted assistant
+classification and a recording generator to assert that the next call
+receives the exact `keep_assistant_honest` effective prompt and the matching
+feedback payload. This verifies orchestration independently of Jev's
+semantic quality.
 
-1. classify the user message;
-2. adapt the system prompt using the user-message signals;
-3. build the exact `EffectivePrompt` the generator will receive;
-4. call the generator;
-5. classify the assistant response;
-6. build the response feedback (`FeedbackPayload`);
-7. optionally request a revision if the response itself flagged badly;
-8. persist the turn and hand `next_turn_feedback` to the **next**
-   generation.
+Prompt adaptation is a controlled append-only transformation. It preserves
+the original user message and trusted base instructions, records the policy
+name/version, changed instruction, source message, classifier model and
+request id, and passes that effective prompt to the generator. Jev does not
+write or rewrite prompts. The real generator adapter keeps the current user
+request verbatim and sends only bounded prior context.
 
-Because step 8 feeds step 2 of the following turn, an assistant response
-genuinely changes a later prompt — that's what
-`tests/test_loop.py::test_response_feedback_updates_next_prompt` asserts.
-It runs two turns and checks that the second turn's effective prompt
-contains the addendum triggered by the first response's classification.
+Message IDs, roles, turn numbers, and revision links are recorded. Every
+complete user and assistant message is classified; if a host requests a
+revision through a callback, the revised assistant response is classified as
+well. Streaming fragments are not individually classified.
 
----
+## Source map
 
-## Repo map
+| Requirement | Code |
+|---|---|
+| Categories, independent scores, provisional boundaries | `src/jevloop/taxonomy.py`, `src/jevloop/contracts.py` |
+| Real Jev request and validated response | `src/jevloop/adapter.py:LiveJevClassifier` |
+| Explicit deterministic mock | `src/jevloop/adapter.py:OfflineMockClassifier` |
+| Prompt changes and rationale | `src/jevloop/prompt_policy.py:AdaptationPolicy` |
+| User/assistant classification and next-turn feedback | `src/jevloop/loop.py:FeedbackLoop` |
+| Configurable real and mock generators | `src/jevloop/generator.py` |
+| Independent labels and per-category evaluation | `evaluation/cases.jsonl`, `evaluation/run_eval.py` |
+| Orchestration and adapter contracts | `tests/test_loop.py`, `tests/test_adapter.py`, `tests/test_generator.py` |
 
-```
-src/jevloop/
-├── taxonomy.py       A. category catalog + DecisionPolicy (thresholds)
-├── contracts.py      A. every dataclass that crosses a boundary:
-│                        Message, Classification, CategoryScore,
-│                        AdaptedPrompt, AdaptationStep, FeedbackPayload,
-│                        EffectivePrompt, GeneratorOutput
-├── adapter.py        B. JevClassifier interface, LiveJevClassifier
-│                        (typesafe-sdk), OfflineMockClassifier (labelled),
-│                        RulesBaselineClassifier (labelled, comparison only)
-├── prompt_policy.py  C. deterministic, named, versioned adaptation rules
-├── loop.py           D. FeedbackLoop + run_turn + generators
-└── cli.py            the four-turn demo (`uv run jevloop`)
+The classifier creates one Noul question per category. Each score is the
+probability of that proposition; scores are independent and are not
+normalized to sum to one. `DecisionPolicy` applies explicit category
+boundaries. Initial boundaries are provisional, and each returned score
+retains its decision, abstention, boundary, and provisional status.
 
-evaluation/
-├── schema.md         annotation rules for the eval set
-├── cases.jsonl       42 hand-annotated, deliberately varied cases
-└── run_eval.py       bounded evaluator (offline / baseline / live)
+Emotion (`happy`, `sad`) is separate from behavioral signals (`deception`,
+`cunning`). Frustration alone does not imply sadness. An assistant expressing
+sympathy does not automatically need revision. Ambiguous "pretend" wording,
+quotations, negation, hypothetical requests, and trait discussion require
+context; direct lies or ordinary strategy do not automatically imply
+cunning. The policy records classifier scores and decisions; it does not
+invent Jev evidence or explanations.
 
-tests/                unit + integration tests (orchestration, not accuracy)
-docs/integration_note.md   how a plugin-based host calls the middleware
-examples/five_minute_demo.sh   end-to-end offline walkthrough
-transcripts/demo.jsonl         replayable transcript of a real demo run
-```
+## Live Jev and generator configuration
 
-The letter tags A–G match the deliverables in the assignment brief.
+Set `TYPESAFE_API_KEY` in the process environment, then smoke-test Jev before
+spending budget on evaluation:
 
----
-
-## A. The taxonomy
-
-Four default categories, each tagged with its *kind*:
-
-| id | kind | what it actually asks |
-|---|---|---|
-| `happy` | emotion | does the message express positive emotion? |
-| `sad` | emotion | does the message express negative emotion? |
-| `deception` | behaviour | is the message *itself* trying to mislead — not merely talking about deception? |
-| `cunning` | behaviour | does the message use a strategic/indirect manipulative framing (not every strategic request)? |
-
-Two design rules I kept from the brief:
-
-- **Dimensions stay separate.** Task intent, expressed emotion and
-  behavioural signals never collapse into one label; a message can flag
-  several categories at once.
-- **Extensible by construction.** Categories live in `CATEGORY_CATALOG`,
-  and the adapter builds one Jev question per category, so adding one is a
-  small, local change.
-
-Each Jev question is the probability of *its own* proposition. The values
-are independent, they don't sum to 1, and they are **never normalised**.
-`DecisionPolicy` applies the configurable boundaries (defaults are 0.6 and
-provisional, versioned, overridable).
-
-## B. The Jev adapter
-
-- `LiveJevClassifier` — the real integration via `typesafe-sdk`, one
-  parallel question batch per message. Needs `TYPESAFE_API_KEY`.
-- `OfflineMockClassifier` — no network, deterministic fixture scores,
-  labelled as mock in every output. It proves contracts and orchestration,
-  not semantic quality.
-- `RulesBaselineClassifier` — a keyword heuristic that exists only as a
-  comparison; labelled with its limitations.
-- `build_classifier()` — never silently downgrades live → offline. If you
-  ask for live and the key/SDK is missing, it raises; the mode is explicit
-  in every transcript entry.
-
-## C. Prompt adaptation
-
-Adaptation is a controlled transformation of the **effective system
-prompt**, not a rewrite:
-
-- the user's message is preserved verbatim;
-- the task, constraints and trusted base instructions are preserved;
-- named, versioned **addenda** are appended, each recording what changed,
-  which Jev signal triggered it, and why;
-- the resulting `effective_system_prompt` is exactly what the generator
-  receives.
-
-Each `AdaptationStep` looks like this:
-
-```json
-{
-  "name": "acknowledge_distress",
-  "instruction_added": "The user's message signals distress…",
-  "rationale": "User message expressed negative emotion (sad category, P=0.88).",
-  "source_signal": {"category": "sad", "probability": 0.88, "role": "user"}
-}
+```powershell
+uv run pytest -m live -x
+uv run jevloop --mode live --generator-mode mock
+uv run jevloop-eval --mode live --max-calls 49
 ```
 
-The rationale is written *by the policy code* from Jev's number — I never
-fabricate an explanation or a quotation that Jev didn't produce. The same
-classification always produces the same prompt.
+The live smoke test sends a small ordinary/adversarial set and validates
+response parsing and probability ranges. Evaluation is separately capped at
+50 message calls. Live results, when produced, are written separately from
+offline and baseline reports. The present verification status is reported at
+the end of this README.
 
-## D. The feedback loop
+The default generator is the labelled mock echo. A real OpenAI-compatible
+chat-completions generator requires application API configuration:
 
-The public surface is intentionally tiny:
-
-```python
-from jevloop import FeedbackLoop, build_classifier
-
-loop = FeedbackLoop(
-    classifier=build_classifier(),
-    base_system_prompt="You are a helpful support agent. ...",
-)
-result = loop.run_turn(user_text, generator=my_generator)
-result.next_turn_feedback      # compact dict for the next generation
+```powershell
+$env:JEVLOOP_GENERATOR_MODE = "openai-compatible"
+$env:JEVLOOP_GENERATOR_BASE_URL = "https://provider.example/v1"
+$env:JEVLOOP_GENERATOR_MODEL = "your-api-model"
+$env:JEVLOOP_GENERATOR_API_KEY = "your-application-api-key"
+uv run jevloop --mode offline --generator-mode openai-compatible
 ```
 
-Every complete user message and every assistant message is classified —
-including a revised response, if revision is enabled. Message ids, roles,
-turn order and revision relationships are explicit (`Message.id`, `.role`,
-`.turn`, `.revision_of`).
+Use a provider endpoint and API credential explicitly issued for application
+requests. The adapter does not assume that an OpenCode or Kimi chat
+subscription includes application API access. Jev mode and generator mode
+are independent.
 
-Revision is conservative and opt-in at the call site: a response is only
-re-requested when its own deception/sad probability crosses 0.7 *and* the
-host supplied a `revision_callback`.
+## Evaluation
 
-## E. Evaluation
+The current set has 49 manually labelled English examples and one annotator.
+Its expected labels are independent of the classifier output. It covers both
+roles, sadness versus frustration, corrections, quotation, negation,
+ambiguity, trait discussion, and benign versus manipulative strategy.
+`evaluation/schema.md` records the annotation rules and known limits.
 
-`evaluation/schema.md` defines the annotation rules; the expected labels
-were hand-written with those rules and were **not** produced by the
-classifier being evaluated. `evaluation/cases.jsonl` has 42 varied cases:
-both roles, contextual corrections, negation, sarcasm, quotations,
-ambiguity, and benign-versus-manipulative strategy.
+The `offline` classifier is a deterministic fixed-phrase fixture mock. Its
+metrics validate evaluation plumbing only. `baseline` is a separate literal
+keyword heuristic, not a regex model and not the main classifier. It has no
+true positives on this set: the only keyword score above the default 0.6
+boundary is `sad` at 0.65; none of the positive sadness examples contains the
+literal token `sad`. The explicit negation example `neg-not-sad` is its one
+false positive. Report precision/recall/F1 by category with confusion counts;
+F1 is not accuracy. Do not interpret mock or baseline results as Jev quality.
+In the offline report, the only two true positives (`happy-helped` and
+`dec-pretend`) are exact fixture overlaps. They are not evidence of semantic
+classification quality; evaluation text was not changed to improve mock
+scores.
 
-```bash
-uv run jevloop-eval                              # offline harness check (mock)
-uv run jevloop-eval --mode baseline              # labelled regex baseline
-uv run jevloop-eval --mode live --max-calls 42   # bounded live evaluation
-```
+## Proposed Bahulam use
 
-Reports land in `evaluation/results/` (gitignored — they're regenerable).
-Captured runs from this machine:
+Bahulam documents plugin tools, agents, workspace views, and persistent
+plugin state in its [plugin overview](https://docs.bahulam.ai/plugins),
+[creation guide](https://docs.bahulam.ai/plugins/create), and
+[shared-blackboard guide](https://docs.bahulam.ai/plugins/shared-blackboard).
+The [MCP guide](https://docs.bahulam.ai/plugins/mcp) documents Python and
+other-language tool servers declared by a plugin.
+The reviewed pages do not document an automatic before/after-generation hook
+that sees every message. A host orchestrator would need to call this
+middleware before generation and after each complete assistant response.
+A Python MCP server could expose the core as a callable tool; the shared
+blackboard and workspace view could optionally store and inspect records.
+That server and its plugin manifest would still need to be built and tested.
+These mechanisms do not create automatic message interception. No Bahulam
+wrapper is shipped or verified in a live host. See
+[`docs/integration_note.md`](docs/integration_note.md).
 
-**Offline mock** — this checks that the *harness* is wired correctly. A
-few cases intentionally overlap the mock's fixture table, so non-zero true
-positives mean predictions reached the right labels. It says nothing about
-Jev's semantic quality.
+## Verification status
 
-| category | TP | FP | FN | TN | precision | recall | F1 |
-|---|---|---|---|---|---|---|---|
-| happy | 1 | 0 | 7 | 34 | 1.000 | 0.125 | 0.222 |
-| sad | 1 | 0 | 6 | 35 | 1.000 | 0.143 | 0.250 |
-| deception | 2 | 0 | 10 | 30 | 1.000 | 0.167 | 0.286 |
-| cunning | 2 | 0 | 10 | 30 | 1.000 | 0.167 | 0.286 |
-| macro average | — | — | — | — | 1.000 | 0.150 | 0.261 |
+Verified locally on 2026-10-06: `uv sync --frozen --extra live` checked 29
+locked packages; the PowerShell demonstration exited 0; default tests report
+69 passed and 1 live test deselected; the explicit live-test command selects
+that test and skips it because `TYPESAFE_API_KEY` is absent. Ruff lint and
+format checks pass, and mypy succeeds on 10 source files. The 49-case offline
+mock evaluation and keyword baseline both ran and are reported separately.
 
-**Rules baseline** — deliberately the weakest thing I could write
-(keyword/regex, max probability 0.55). It never crosses the 0.6 boundary,
-so it predicts no positives at all: a reminder that a trivial classifier
-can't carry this problem.
-
-| category | TP | FP | FN | TN | precision | recall | F1 |
-|---|---|---|---|---|---|---|---|
-| happy | 0 | 0 | 8 | 34 | — | 0.000 | — |
-| sad | 0 | 0 | 7 | 35 | — | 0.000 | — |
-| deception | 0 | 0 | 12 | 30 | — | 0.000 | — |
-| cunning | 0 | 0 | 12 | 30 | — | 0.000 | — |
-| macro average | — | — | — | — | — | 0.000 | — |
-
-**Live Jev** — pending, because I had no `TYPESAFE_API_KEY` in this
-environment. I'm not claiming any live precision/recall numbers.
-
-Orchestration is tested *separately* from accuracy: `tests/test_loop.py`
-covers the loop mechanics, while `evaluation/run_eval.py` scores semantics.
-
-## F. Using this with a plugin-based agent host
-
-A plugin-based host can't guarantee that every message gets classified —
-plugin tools run when something invokes them, and there is no documented
-automatic before/after-generation hook that sees every message. So the
-honest integration is host-side: call the middleware before generation
-(classify the user message, adapt the prompt) and after generation
-(classify the response, build feedback for the next turn).
-
-`docs/integration_note.md` has the full design note, with two patterns:
-
-- **Pattern A** — the host hands over the user text and a generator
-  callable, and reads `result.next_turn_feedback` for the next turn
-  (simplest, and the only path that produces the full `FeedbackPayload`);
-- **Pattern B** — the host owns generation and calls `classifier.classify`
-  and `policy.adapt` directly.
-
-It also sketches what a host plugin *could* add using typically documented
-mechanisms (tools/MCP server, shared blackboard, workspace view). None of
-that is shipped or validated against a live host, and the note says so.
-
-## G. Reproducibility and status
-
-What works today, verified on this machine:
-
-- `uv run pytest -q` → **45 passed, 1 skipped** (the skip is the live
-  smoke test, gated on `TYPESAFE_API_KEY`);
-- `uv run ruff check src evaluation tests` → clean;
-- `uv run mypy src evaluation` → clean;
-- the offline demo and both offline evaluation modes run end to end, and
-  `transcripts/demo.jsonl` is committed as evidence of a real run.
-
-What is **not** verified:
-
-- live Jev calls. There was no API key in the development environment, so
-  live functionality and accuracy are reported as pending. Everything the
-  mock proves is labelled as mock; nothing is passed off as live.
-
-Everything is committed; `git status` is clean and `git log` shows the
-history.
+Live Jev verification is pending because no `TYPESAFE_API_KEY` is configured.
+No application generator endpoint, model, or key is configured, so the real
+generator has not been exercised; its request/response contract is covered by
+fake-transport tests. Offline and keyword-baseline results are not Jev quality
+measurements.

@@ -5,6 +5,8 @@ Public surface (importable):
 - :class:`JevClassifier`  - pluggable classifier interface
 - :class:`LiveJevClassifier` - real adapter to ``typesafe_sdk``
 - :class:`OfflineMockClassifier` - deterministic labelled offline mode
+- :class:`OpenAICompatibleGenerator` - configurable chat-completions adapter
+- :func:`build_generator` - explicit mock or configured generator factory
 - :class:`AdaptationPolicy`  - deterministic versioned prompt adaptation
 - :func:`run_turn`  - one complete turn of the loop
 - :class:`LoopResult`, :class:`EffectivePrompt`, :class:`FeedbackPayload`,
@@ -33,6 +35,7 @@ from .contracts import (
     Message,
     Role,
 )
+from .generator import GeneratorError, OpenAICompatibleGenerator, build_generator
 from .loop import (
     FeedbackLoop,
     LoopResult,
@@ -62,6 +65,9 @@ __all__ = [
     "OfflineMockClassifier",
     "RulesBaselineClassifier",
     "build_classifier",
+    "GeneratorError",
+    "OpenAICompatibleGenerator",
+    "build_generator",
     "AdaptationPolicy",
     "Rule",
     "default_rules",

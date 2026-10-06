@@ -20,5 +20,6 @@ uv.lock.local
 # Live evaluation artifacts (committed summaries only; raw responses live here)
 live_eval/
 transcripts/live/
+transcripts/run.jsonl
 # Eval reports are regenerable; README shows a captured sample
 evaluation/results/*.json

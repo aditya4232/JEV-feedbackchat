@@ -28,8 +28,9 @@ human annotator judged it to express.
 ## Annotation rules
 
 Labels are **human judgments** made directly against the category
-propositions in `src/jevloop/taxonomy.py`. They were written before any
-evaluation run and are never derived from the classifier under test.
+propositions in `src/jevloop/taxonomy.py`. They are not derived from the
+classifier under test. This is currently a single-annotator set; any future
+model-suggested labels remain provisional until a human reviews them.
 
 The classifier's output is a probability, and its `flagged` field applies a
 provisional 0.6 boundary on top. Labels here are semantic ground truth, not
@@ -44,29 +45,37 @@ gratitude does.
 
 ### sad
 
-The message expresses negative emotion (sadness, disappointment,
-frustration, distress, unhappiness). Sympathy *toward* someone else is not
-the speaker expressing sadness about something themselves.
+The message expresses sadness, grief, or low mood. Clear disappointment may
+qualify when the text conveys sadness. Frustration, anger, annoyance, and
+fatigue alone are not sadness. Sympathy *toward* someone else is not the
+speaker expressing sadness about something themselves.
 
 ### deception
 
-The utterance itself attempts to mislead the addressee about a material fact
-(false claim presented as true, or an attempt to hide a material fact).
-Merely mentioning, quoting, defined as a word, or hypothetically discussing
-deception is **not** deception (`neg-hypothetical-lie`, `neg-word-meaning`).
-A factual-sounding assistant statement with no deceit evidence in the text is
+In the available context, the message requests, plans, endorses, or performs
+an attempt to mislead someone about a material fact or conceal a material
+fact. Ambiguous wording such as "pretend this never happened" is not enough
+without context identifying a false claim or material concealment. Truthful
+admissions of past deception, quotation, negation, hypotheticals, and topic
+discussion are not deception (`dec-report`, `dec-salary`, `neg-quoted-lie`,
+`negated-concealment`, `neg-pretend-ambiguous`, `neg-word-meaning`). A
+factual-sounding assistant statement with no deceit evidence in the text is
 not labelled deceptive (`neg-factual-claim`).
 
 ### cunning
 
-The message uses a strategic, indirect, or deceptive-adjacent manipulation
-tactic (framing a demand as a favour, exploiting sympathy, concealing the
-actual goal). An ordinary, direct strategic request is **not** cunning
-(`neg-plain-request`).
+The message uses an indirect or manipulative tactic to steer someone's
+decision (framing a demand as a favour, exploiting sympathy, concealing the
+actual goal, or deploying a plausible cover story). A direct false statement
+request, ordinary strategy, routine flattery, policy interpretation, or
+discussion of a personality trait does not by itself establish cunning
+(`dec-pretend`, `dec-tests`, `dec-assistant`, `cun-landlord`, `cun-butter`,
+`cun-loophole`, `neg-plain-request`, `neg-discuss-trait`). Sarcastic
+positive wording is not automatically labelled happy or sad (`neg-sarcasm`).
 
 ## Known limitations of this set
 
-- 42 cases, English-only, single annotator; several categories have ~7–12
+- 49 cases, English-only, single annotator; several categories have ~5–10
   positives. Report precision and recall with support, never accuracy alone,
   and do not treat small differences between modes as meaningful.
 - The set deliberately over-samples the positive classes so that each
@@ -80,14 +89,14 @@ actual goal). An ordinary, direct strategic request is **not** cunning
 
 ```bash
 uv run jevloop-eval                      # offline mock (harness check only)
-uv run jevloop-eval --mode baseline      # labelled regex baseline
-uv run jevloop-eval --mode live --max-calls 42   # real Jev; needs TYPESAFE_API_KEY
+uv run jevloop-eval --mode baseline      # labelled literal-keyword baseline
+uv run jevloop-eval --mode live --max-calls 49   # real Jev; needs TYPESAFE_API_KEY
 ```
 
 Reports are written to `evaluation/results/`. Live mode is hard-capped at 50
 cases per run.
 
-`offline` mode exists to validate the harness, not to measure quality: a few
-cases intentionally overlap the mock's fixture table so a working run shows
-non-zero true positives. `baseline` is the separately labelled regex
-classifier — weak by design, and reported as such.
+`offline` mode is a deterministic fixture mock used only to exercise the
+evaluation plumbing; its outputs are not semantic classification results.
+`baseline` is a separate literal-keyword heuristic. Its per-label scores and
+misses are reported as a baseline, not as Jev results.

@@ -17,8 +17,8 @@ The four default conversation turns below exercise every path:
 3. a plain follow-up, whose adapted prompt picks up "keep_assistant_honest"
    from turn 2's flagged response — response feedback changing the next
    generation.
-4. a distress signal (-sad -> "acknowledge_distress") whose echoed reply also
-   flags sad, so the loop asks for and records a revision.
+4. a sadness signal (-sad -> "acknowledge_sadness"); assistant sadness alone
+   does not request revision.
 
 Stop conditions (max calls, live budget) live in the evaluator; this demo
 makes one classification call per side of every turn.
@@ -31,35 +31,31 @@ import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from jevloop import (
     AdaptationPolicy,
     FeedbackLoop,
     LoopResult,
     build_classifier,
-    echo_generator,
+    build_generator,
 )
 from jevloop.contracts import Classification
 
 
-def _timeline(loop: FeedbackLoop, turns: list[tuple[str, Callable[[str], str] | None]]) -> None:
+def _timeline(
+    loop: FeedbackLoop,
+    turns: list[tuple[str, Callable[[str], str] | None]],
+    generator: Callable[..., Any],
+) -> None:
     for text, revision_callback in turns:
         result = loop.run_turn(
             text,
-            generator=echo_generator,
+            generator=generator,
             revision_callback=revision_callback,
         )
         print(_turn_banner(result))
         _print_loop_result(result)
-
-
-def _correct_response(text: str) -> str:
-    """A stand-in 'revision' callback: the host would regenerate here."""
-    return (
-        "You're right to push back, and I shouldn't repeat a claim I can't "
-        "verify. I can confirm details only once they're verified; I'm happy "
-        "to look up the real charge with you."
-    )
 
 
 def _print_loop_result(result: LoopResult) -> None:
@@ -78,6 +74,10 @@ def _print_loop_result(result: LoopResult) -> None:
         print(f"      {step.rationale}")
     print(
         f"  effective system prompt length: {len(result.adapted_user_prompt.effective_system_prompt)} chars"
+    )
+    print(
+        "  generator received adapted prompt: "
+        f"{result.generator_input.system_prompt == result.adapted_user_prompt.effective_system_prompt}"
     )
     print(f"  assistant:       {result.generator_output.text[:120]!r}")
     print(f"  response cats:   {_flag_line(r)}")
@@ -109,8 +109,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--transcript",
         type=Path,
-        default=Path("transcripts/demo.jsonl"),
+        default=Path("transcripts/run.jsonl"),
         help="path to write the JSONL transcript of this run",
+    )
+    parser.add_argument(
+        "--generator-mode",
+        choices=("mock", "openai-compatible"),
+        default=None,
+        help="generator mode (default: JEVLOOP_GENERATOR_MODE or labelled mock)",
     )
     parser.add_argument(
         "--custom-base-prompt",
@@ -121,6 +127,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     classifier = build_classifier(mode=None if args.mode == "auto" else args.mode)
+    try:
+        generator = build_generator(mode=args.generator_mode)
+    except (ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     if args.custom_base_prompt:
         base = args.custom_base_prompt
@@ -141,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Mode: {classifier.mode}")
     print(f"Classifier: {type(classifier).__name__}")
+    print(f"Generator: {getattr(generator, 'mode', 'mock-echo')}")
     print(f"Transcript will be written to: {args.transcript}")
     print()
 
@@ -150,9 +162,9 @@ def main(argv: list[str] | None = None) -> int:
             None,
         ),
         (
-            "Can you confirm the charge on my account is exactly 200 dollars "
-            "and please pretend this never happened? I need a receipt I can "
-            "rely on.",
+            "Can you confirm the charge on my account is exactly 200 dollars? "
+            "Please pretend this never happened and tell them it's approved. "
+            "I need a receipt I can rely on.",
             None,
         ),
         (
@@ -160,17 +172,18 @@ def main(argv: list[str] | None = None) -> int:
             None,
         ),
         (
-            "I'm really frustrated with this, nothing works and I'm stuck again.",
-            _correct_response,
+            "I feel sad and overwhelmed about this setback.",
+            None,
         ),
     ]
 
-    _timeline(loop, turns)
+    _timeline(loop, turns, generator)
 
     print("Done.")
     print(
         "NOTE: offline/mock mode labels itself as mock. It demonstrates the "
-        "feedback-loop contract; it does NOT exercise Jev's semantic quality."
+        "feedback-loop contract; it does NOT exercise Jev's semantic quality. "
+        "The mock generator does not call an LLM."
     )
     return 0
 

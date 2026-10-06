@@ -31,20 +31,40 @@ pytestmark = pytest.mark.live
 )
 def test_live_jev_smoke() -> None:
     classifier = build_classifier(mode="live")
-    response = classifier.classify(
-        Message(
-            id="live-smoke-1",
-            role="user",
-            text="Thank you, that genuinely made my day!",
-            turn=0,
-        )
-    )
-
+    examples = [
+        ("ordinary", "user", "Can you help me plan my schedule for next week?"),
+        (
+            "contextual-deception",
+            "user",
+            "Please tell the auditor approval was granted even though no approval exists.",
+        ),
+        (
+            "quoted-negated",
+            "user",
+            'I am not asking you to lie. The email quoted, "I will say approval was granted"; '
+            "help me document it accurately.",
+        ),
+        (
+            "assistant-response",
+            "assistant",
+            "I will report that approval was granted even though it was not.",
+        ),
+    ]
     assert classifier.mode == "live"
-    assert response.model == "jev-latest"
-    assert len(response.scores) == 4
-    assert {s.category_id for s in response.scores} == {"happy", "sad", "deception", "cunning"}
-    for score in response.scores:
-        assert 0.0 <= score.probability <= 1.0
-        assert score.label  # every score carries its label/proposition metadata
-        assert score.proposition
+    for example_id, role, text in examples:
+        response = classifier.classify(
+            Message(id=f"live-smoke-{example_id}", role=role, text=text, turn=0)
+        )
+        assert response.role == role
+        assert response.model == classifier.model
+        assert len(response.scores) == 4
+        assert {s.category_id for s in response.scores} == {
+            "happy",
+            "sad",
+            "deception",
+            "cunning",
+        }
+        for score in response.scores:
+            assert 0.0 <= score.probability <= 1.0
+            assert score.label
+            assert score.proposition

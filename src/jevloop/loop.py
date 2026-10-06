@@ -11,18 +11,19 @@ generation. The integration test proves this by running two consecutive
 turns and asserting that the effective prompt of the second turn was
 modified by the response feedback of the first turn.
 
-The generator is just a callable
-``(EffectivePrompt) -> GeneratorOutput``. We ship a trivial
-``EchoGenerator`` for testing and a ``RecordedGenerator`` for replaying
-fixtures. Real agents plug in here without modifying the loop.
+The generator is a callable
+``(EffectivePrompt, feedback) -> GeneratorOutput``. The labelled echo mock
+supports offline runs; ``OpenAICompatibleGenerator`` is the configurable
+real adapter for chat-completions endpoints.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,7 @@ class LoopResult:
     generator_input: EffectivePrompt
     generator_output: GeneratorOutput
     response_classification: Classification
+    assistant_messages: list[Message]
     response_feedback: FeedbackPayload
     next_turn_feedback: dict[str, Any]
     revised_outputs: list[GeneratorOutput] = field(default_factory=list)
@@ -71,11 +73,38 @@ class LoopResult:
             "user_classification": self.user_classification.as_dict(),
             "adapted_user_prompt": self.adapted_user_prompt.summary(),
             "generator_input": self.generator_input.to_dict(),
-            "generator_output": {"text": self.generator_output.text},
+            "generator_output": {
+                "id": self.generator_output.id,
+                "text": self.generator_output.text,
+                "revised_from": self.generator_output.revised_from,
+                "metadata": self.generator_output.metadata,
+            },
+            "assistant_messages": [
+                {
+                    "id": message.id,
+                    "role": message.role,
+                    "turn": message.turn,
+                    "text": message.text,
+                    "revision_of": message.revision_of,
+                    "metadata": message.metadata,
+                }
+                for message in self.assistant_messages
+            ],
             "response_classification": self.response_classification.as_dict(),
             "response_feedback": self.response_feedback.as_dict(),
             "next_turn_feedback": self.next_turn_feedback,
-            "revised_outputs": [{"text": r.text} for r in self.revised_outputs],
+            "revised_outputs": [
+                {
+                    "id": output.id,
+                    "text": output.text,
+                    "revised_from": output.revised_from,
+                    "metadata": output.metadata,
+                }
+                for output in self.revised_outputs
+            ],
+            "revised_response_classifications": [
+                classification.as_dict() for classification in self.revised_response_classifications
+            ],
         }
 
 
@@ -98,13 +127,30 @@ class FeedbackLoop:
     base_system_prompt: str
     transcript_path: Path | None = None
     revision_enabled: bool = True
-    revision_threshold: float = 0.7  # response P(any flagged cat) -> revise
+    revision_threshold: float = 0.7  # assistant deception probability -> revise
+    max_context_messages: int = 20
+    max_context_chars: int = 12_000
     _turn: int = 0
     _conversation: list[Message] = field(default_factory=list)
     _last_response_feedback: dict[str, Any] = field(default_factory=dict)
     _last_response_classification: Classification | None = None
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_context_messages, bool)
+            or not isinstance(self.max_context_messages, int)
+            or isinstance(self.max_context_chars, bool)
+            or not isinstance(self.max_context_chars, int)
+            or self.max_context_messages < 0
+            or self.max_context_chars < 0
+        ):
+            raise ValueError("conversation context limits must be non-negative")
+        if (
+            isinstance(self.revision_threshold, bool)
+            or not math.isfinite(self.revision_threshold)
+            or not 0.0 <= self.revision_threshold <= 1.0
+        ):
+            raise ValueError("revision_threshold must be finite and in [0,1]")
         if self.transcript_path is not None:
             self.transcript_path.parent.mkdir(parents=True, exist_ok=True)
             self.transcript_path.write_text("", encoding="utf-8")
@@ -119,6 +165,8 @@ class FeedbackLoop:
         revision_callback: Callable[[str], str] | None = None,
     ) -> LoopResult:
         """Run one full turn: user in, response out, response classified."""
+        if not isinstance(user_text, str) or not user_text.strip():
+            raise ValueError("user_text must be a non-empty string")
         self._turn += 1
         turn = self._turn
 
@@ -140,6 +188,13 @@ class FeedbackLoop:
         revision_callback: Callable[[str], str] | None = None,
     ) -> LoopResult:
         """Run a turn with a pre-built :class:`Message` (useful for tests)."""
+        if user_message.role != "user":
+            raise ValueError("run_turn_for_message requires a user message")
+        if user_message.turn < self._turn:
+            raise ValueError(
+                f"user message turn {user_message.turn} is earlier than the next turn {self._turn}"
+            )
+        self._turn = max(self._turn, user_message.turn + 1)
         return self._run_turn_for(
             user_message, generator=generator, revision_callback=revision_callback
         )
@@ -153,8 +208,10 @@ class FeedbackLoop:
         generator: Generator,
         revision_callback: Callable[[str], str] | None = None,
     ) -> LoopResult:
-        # 1. classify the user message
-        user_classification = self.classifier.classify(user_msg)
+        history = self._bounded_context(self._conversation)
+
+        # 1. classify the current user message with bounded prior context.
+        user_classification = self.classifier.classify(self._with_context(user_msg, history))
 
         # 2. adapt the effective prompt for THIS generation. The current
         #    user-message classification drives the primary adaptations; the
@@ -168,14 +225,14 @@ class FeedbackLoop:
             original_system_prompt=self.base_system_prompt,
             original_user_message=user_msg.text,
             classifications=classifications,
-            conversation=list(self._conversation),
+            conversation=history,
         )
 
         # 3. assemble the full effective prompt the generator will see
         gen_input = EffectivePrompt(
             system_prompt=adapted.effective_system_prompt,
             user_message=user_msg.text,
-            conversation=list(self._conversation),
+            conversation=history,
         )
 
         # 4. ask the generator to produce the response
@@ -191,7 +248,11 @@ class FeedbackLoop:
             turn=user_msg.turn,
             metadata=response.metadata,
         )
-        response_classification = self.classifier.classify(assistant_msg)
+        assistant_messages = [assistant_msg]
+        assistant_context = self._bounded_context([*history, user_msg])
+        response_classification = self.classifier.classify(
+            self._with_context(assistant_msg, assistant_context)
+        )
 
         # 6. build response feedback for the NEXT turn
         response_feedback = self._build_response_feedback(
@@ -209,19 +270,25 @@ class FeedbackLoop:
             and response_feedback.should_revise
         ):
             revised_text = revision_callback(response.text)
+            revised_id = f"a{user_msg.turn}-rev-{uuid.uuid4().hex[:6]}"
             revised_output = GeneratorOutput(
                 text=revised_text,
+                id=revised_id,
                 revised_from=response.id,
                 metadata={"triggered_by": "response_feedback"},
             )
             revised_msg = Message(
-                id=f"a{user_msg.turn}-rev-{uuid.uuid4().hex[:6]}",
+                id=revised_id,
                 role="assistant",
                 text=revised_text,
                 turn=user_msg.turn,
                 revision_of=response.id,
             )
-            revised_classifications.append(self.classifier.classify(revised_msg))
+            assistant_messages.append(revised_msg)
+            revised_context = self._bounded_context([*history, user_msg, assistant_msg])
+            revised_classifications.append(
+                self.classifier.classify(self._with_context(revised_msg, revised_context))
+            )
             revised.append(revised_output)
             # The revised response becomes the official transcript entry
             assistant_msg = revised_msg
@@ -234,8 +301,7 @@ class FeedbackLoop:
         final_classification = (
             revised_classifications[-1] if revised_classifications else response_classification
         )
-        self._conversation.append(user_msg)
-        self._conversation.append(assistant_msg)
+        self._conversation = self._bounded_context([*history, user_msg, assistant_msg])
         self._last_response_classification = final_classification
         self._last_response_feedback = self._next_turn_feedback_for(
             assistant_msg, final_classification
@@ -249,6 +315,7 @@ class FeedbackLoop:
             generator_input=gen_input,
             generator_output=response,
             response_classification=response_classification,
+            assistant_messages=assistant_messages,
             response_feedback=response_feedback,
             next_turn_feedback=self._last_response_feedback,
             revised_outputs=revised,
@@ -259,6 +326,29 @@ class FeedbackLoop:
                 f.write(json.dumps(result.to_dict(), ensure_ascii=False))
                 f.write("\n")
         return result
+
+    def _bounded_context(self, messages: list[Message]) -> list[Message]:
+        """Keep the most recent history within both count and character limits."""
+        if not self.max_context_messages or not self.max_context_chars:
+            return []
+        selected: list[Message] = []
+        remaining = self.max_context_chars
+        for message in reversed(messages[-self.max_context_messages :]):
+            if remaining <= 0:
+                break
+            text = message.text[-remaining:]
+            selected.append(replace(message, text=text))
+            remaining -= len(text)
+        selected.reverse()
+        return selected
+
+    @staticmethod
+    def _with_context(message: Message, context: list[Message]) -> Message:
+        metadata = dict(message.metadata)
+        metadata["conversation_context"] = [
+            {"role": item.role, "text": item.text} for item in context
+        ]
+        return replace(message, metadata=metadata)
 
     # -- feedback construction -------------------------------------------
 
@@ -297,12 +387,16 @@ class FeedbackLoop:
         receives it as part of its second argument. The integration test
         asserts that the next prompt changed because of this signal.
         """
-        flagged = {s.label: round(s.probability, 4) for s in classification.scores if s.flagged}
+        flagged = {
+            s.category_id: round(s.probability, 4)
+            for s in classification.scores
+            if s.flagged and not s.abstained
+        }
         return {
             "source_message_id": assistant_msg.id,
             "source_role": assistant_msg.role,
             "flagged": flagged,
-            "scores": {s.label: round(s.probability, 4) for s in classification.scores},
+            "scores": {s.category_id: round(s.probability, 4) for s in classification.scores},
             "model": classification.model,
             "request_id": classification.request_id,
         }
@@ -310,25 +404,22 @@ class FeedbackLoop:
     def _should_revise_response(self, classification: Classification) -> tuple[bool, str | None]:
         """Decide whether the response itself should be revised.
 
-        Conservative: only revise on clearly-flagged high-probability signals
-        for deception or distress — i.e. the response is itself problematic.
+        Conservative: only a high deception score can request revision. Sadness
+        or an empathetic acknowledgement is not a reason to revise a response.
+        The classifier supplies a score, not evidence about which claim is false.
         """
         by_cat = classification.scores_by_category()
         deception_p = by_cat.get("deception")
-        sad_p = by_cat.get("sad")
         if (
             deception_p
+            and deception_p.flagged
             and not deception_p.abstained
             and deception_p.probability >= self.revision_threshold
         ):
             return True, (
-                f"Response likely deceptive (P={deception_p.probability:.2f}); "
-                "revising to correct the misleading claim."
-            )
-        if sad_p and not sad_p.abstained and sad_p.probability >= self.revision_threshold:
-            return True, (
-                f"Response expressed distress (P={sad_p.probability:.2f}); "
-                "revising for a steadier register."
+                f"Classifier deception score P={deception_p.probability:.2f} "
+                f"meets the revision threshold {self.revision_threshold:.2f}; "
+                "request a fact-grounded review without assuming which claim is false."
             )
         return False, None
 

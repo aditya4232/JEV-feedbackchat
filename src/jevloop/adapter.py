@@ -5,23 +5,24 @@ Design:
   :class:`Message` into a :class:`Classification` is a valid classifier.
 - :class:`LiveJevClassifier` is the real adapter to ``typesafe_sdk``. It
   evaluates ONE Noul per category in a single parallel call, so the live
-  path matches the documented Jev contract (independent questions, one
-  request, calibrated probabilities).
+  path keeps the questions independent and sends one request per complete
+  message. Returned probabilities are preserved without normalization.
 - :class:`OfflineMockClassifier` is an honest offline mode. It is
   *labelled* in the output as offline/mock and demonstrates orchestration
   only; it is NOT a substitute for Jev's semantic quality.
 - :func:`build_classifier` selects between them based on environment
-  configuration. We never silently fall back to mock: if ``TYPESAFE_API_KEY``
-  is missing, the constructor raises and the caller decides whether to
-  use the labelled offline mock explicitly.
+  configuration. We never silently fall back to mock: the first live
+  classification call raises if ``TYPESAFE_API_KEY`` is missing, and the
+  caller must select the labelled offline mock explicitly.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from .contracts import CategoryScore, Classification, Message, Role
@@ -48,15 +49,39 @@ class JevClassifier(ABC):
 
     mode: str  # "live" or "offline" or "baseline" — surfaced in output
 
-    def __init__(self, decision_policy: DecisionPolicy):
-        self.decision_policy = decision_policy
+    def __init__(
+        self,
+        decision_policy: DecisionPolicy,
+        categories: Iterable[Category] = CATEGORY_CATALOG,
+    ):
+        self.categories = tuple(categories)
+        category_ids = [category.id for category in self.categories]
+        if not self.categories:
+            raise ValueError("at least one category is required")
+        if len(category_ids) != len(set(category_ids)):
+            raise ValueError("category ids must be unique")
+        boundaries = {category.id: category.decision_boundary for category in self.categories}
+        boundaries.update(decision_policy.boundaries)
+        self.decision_policy = DecisionPolicy(
+            boundaries=boundaries,
+            version=decision_policy.version,
+        )
+
+    def _resolve_categories(self, categories: Iterable[Category] | None) -> tuple[Category, ...]:
+        resolved = self.categories if categories is None else tuple(categories)
+        ids = [category.id for category in resolved]
+        if not resolved:
+            raise ValueError("at least one category is required")
+        if len(ids) != len(set(ids)):
+            raise ValueError("category ids must be unique")
+        return tuple(resolved)
 
     @abstractmethod
     def classify(
         self,
         message: Message,
         *,
-        categories: Iterable[Category] = CATEGORY_CATALOG,
+        categories: Iterable[Category] | None = None,
     ) -> Classification: ...
 
 
@@ -72,7 +97,8 @@ def _safe_request_id(result: Any) -> str | None:
     so we wrap the access defensively.
     """
     try:
-        return getattr(result, "request_id", None)
+        request_id = getattr(result, "request_id", None)
+        return request_id if isinstance(request_id, str) and request_id else None
     except Exception:
         return None
 
@@ -86,8 +112,7 @@ class LiveJevClassifier(JevClassifier):
     """Real adapter to the TypeSafe ``typesafe_sdk`` Jev model.
 
     Each call evaluates one Noul per category in a single parallel batch,
-    preserving Jev's contract: independent probabilities, calibrated outputs,
-    one round-trip.
+    preserving independent probabilities without normalization.
 
     Requires ``TYPESAFE_API_KEY``. Optional ``TYPESAFE_BASE_URL`` for
     self-hosted or gateway-routed deployments. The ``model`` arg selects
@@ -102,13 +127,14 @@ class LiveJevClassifier(JevClassifier):
         *,
         api_key: str | None = None,
         base_url: str | None = None,
-        model: str = "jev-latest",
+        model: str | None = None,
         client: Any = None,  # pre-built typesafe_sdk.TypeSafeClient
+        categories: Iterable[Category] = CATEGORY_CATALOG,
     ):
-        super().__init__(decision_policy)
+        super().__init__(decision_policy, categories)
         self.api_key = api_key or os.environ.get("TYPESAFE_API_KEY")
         self.base_url = base_url or os.environ.get("TYPESAFE_BASE_URL")
-        self.model = model
+        self.model = model or os.environ.get("TYPESAFE_DEFAULT_MODEL", "jev-latest")
         self._client = client  # lazy-imported; populated on first call if None
 
     def _get_client(self) -> Any:
@@ -136,9 +162,9 @@ class LiveJevClassifier(JevClassifier):
         self,
         message: Message,
         *,
-        categories: Iterable[Category] = CATEGORY_CATALOG,
+        categories: Iterable[Category] | None = None,
     ) -> Classification:
-        cats = tuple(categories)
+        cats = self._resolve_categories(categories)
         try:
             from typesafe_sdk import Noul
         except ImportError as e:
@@ -155,20 +181,40 @@ class LiveJevClassifier(JevClassifier):
         try:
             result = client.system_one(state, questions)
         except Exception as e:  # typesafe_sdk raises TypeSafeAPIError etc.
-            raise ClassifierError(f"Jev call failed: {e}") from e
+            raise ClassifierError(f"Jev call failed ({type(e).__name__})") from None
         latency_ms = (time.perf_counter() - started) * 1000.0
 
         scores: list[CategoryScore] = []
+        try:
+            answers = result.nouls
+        except Exception as e:
+            raise ClassifierError("Jev response is missing category answers") from e
+        if not isinstance(answers, Mapping):
+            raise ClassifierError("Jev response category answers are not a mapping")
+
         for c in cats:
             try:
-                noul_answer = result.nouls[c.id]
-                p = float(noul_answer.noul)
-            except (KeyError, AttributeError) as e:
+                noul_answer = answers[c.id]
+                raw_probability = noul_answer.noul
+                if isinstance(raw_probability, bool) or not isinstance(
+                    raw_probability, (int, float)
+                ):
+                    raise TypeError("probability must be numeric")
+                p = float(raw_probability)
+                abstained = getattr(noul_answer, "abstained", False)
+                if not isinstance(abstained, bool):
+                    raise TypeError("abstained must be boolean")
+            except (KeyError, AttributeError, TypeError, ValueError) as e:
                 raise ClassifierError(
-                    f"Classifier returned no answer for category {c.id!r}: {e}"
+                    f"Jev response has an invalid answer for category {c.id!r}"
                 ) from e
-            abstained = bool(getattr(noul_answer, "abstained", False))
-            threshold = self.decision_policy.threshold_for(c.id)
+            if not math.isfinite(p) or not 0.0 <= p <= 1.0:
+                raise ClassifierError(
+                    f"Jev response probability for category {c.id!r} must be finite and in [0,1]"
+                )
+            threshold = self.decision_policy.threshold_for(
+                c.id, default_boundary=c.decision_boundary
+            )
             scores.append(
                 CategoryScore(
                     category_id=c.id,
@@ -177,6 +223,8 @@ class LiveJevClassifier(JevClassifier):
                     probability=p,
                     flagged=(not abstained) and p >= threshold,
                     abstained=abstained,
+                    decision_boundary=threshold,
+                    decision_provisional=c.provisional,
                 )
             )
 
@@ -198,15 +246,35 @@ class LiveJevClassifier(JevClassifier):
     def _build_state(self, message: Message) -> dict[str, Any]:
         """Wrap the message as Jev state.
 
-        Jev evaluates typed questions against a state. For message
-        classification, the state is the message text plus minimal
-        metadata. Keeping it small matches Jev's "atomic question" design.
+        Jev evaluates typed questions against the current message and a
+        bounded, role-tagged history. The history is context only; the current
+        message remains a separate field.
         """
+        raw_context = message.metadata.get("conversation_context", [])
+        context: list[dict[str, str]] = []
+        context_chars = 0
+        if isinstance(raw_context, list):
+            for item in reversed(raw_context[-20:]):
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role")
+                text = item.get("text")
+                if role not in ("user", "assistant") or not isinstance(text, str):
+                    continue
+                remaining = 12_000 - context_chars
+                if remaining <= 0:
+                    break
+                bounded_text = text[-remaining:]
+                context.append({"role": role, "text": bounded_text})
+                context_chars += len(bounded_text)
+            context.reverse()
+
         return {
             "role": message.role,
             "message_id": message.id,
             "turn": message.turn,
             "text": message.text,
+            "conversation_context": context,
         }
 
 
@@ -220,8 +288,8 @@ class OfflineMockClassifier(JevClassifier):
 
     This mode demonstrates contracts and orchestration. It is NOT Jev and
     has no semantic quality. The mock returns deterministic per-category
-    scores derived from a small fixture table, with calibrated-to-mock
-    probabilities. The fixtures are checked into the repo so tests and
+    scores derived from a small fixture table. The fixture scores are not
+    semantic predictions. The fixtures are checked into the repo so tests and
     reviewers can see exactly what the mock believes.
 
     To repeat the assignment rule explicitly: the mock exists for offline
@@ -237,25 +305,38 @@ class OfflineMockClassifier(JevClassifier):
         *,
         fixtures: dict[str, dict[str, float]] | None = None,
         unknown_default: float = 0.05,
+        categories: Iterable[Category] = CATEGORY_CATALOG,
     ):
-        super().__init__(decision_policy)
+        super().__init__(decision_policy, categories)
         # Default fixtures cover a handful of clearly-distinguishable inputs so
         # the offline demo can be run without any data files.
-        self.fixtures = fixtures or _DEFAULT_FIXTURES
+        self.fixtures = _DEFAULT_FIXTURES if fixtures is None else fixtures
+        if (
+            isinstance(unknown_default, bool)
+            or not math.isfinite(unknown_default)
+            or not 0.0 <= unknown_default <= 1.0
+        ):
+            raise ValueError("unknown_default must be finite and in [0,1]")
         self.unknown_default = unknown_default
 
     def classify(
         self,
         message: Message,
         *,
-        categories: Iterable[Category] = CATEGORY_CATALOG,
+        categories: Iterable[Category] | None = None,
     ) -> Classification:
-        cats = tuple(categories)
+        cats = self._resolve_categories(categories)
         scores: list[CategoryScore] = []
         raw: dict[str, Any] = {}
         for c in cats:
             p = self._score(c.id, message.text, message.role)
-            threshold = self.decision_policy.threshold_for(c.id)
+            if not math.isfinite(p) or not 0.0 <= p <= 1.0:
+                raise ClassifierError(
+                    f"offline mock fixture probability for {c.id!r} must be in [0,1]"
+                )
+            threshold = self.decision_policy.threshold_for(
+                c.id, default_boundary=c.decision_boundary
+            )
             raw[c.id] = {"noul": p, "abstained": False}
             scores.append(
                 CategoryScore(
@@ -265,6 +346,8 @@ class OfflineMockClassifier(JevClassifier):
                     probability=p,
                     flagged=p >= threshold,
                     abstained=False,
+                    decision_boundary=threshold,
+                    decision_provisional=c.provisional,
                 )
             )
 
@@ -280,13 +363,15 @@ class OfflineMockClassifier(JevClassifier):
 
     def _score(self, category_id: str, text: str, role: Role) -> float:
         # Literal (case-insensitive) substring match against the fixture table.
+        # Take each category's maximum across matching fixtures so an unrelated
+        # neutral phrase cannot mask a separate explicit signal in the same text.
         lowered = text.lower()
-        for key, per_cat in self.fixtures.items():
-            if key.lower() in lowered:
-                return per_cat.get(category_id, self.unknown_default)
-        # Fallback: neutral, low probability on everything. The mock is
-        # honest about not knowing.
-        return self.unknown_default
+        matching_scores = [
+            per_cat.get(category_id, self.unknown_default)
+            for key, per_cat in self.fixtures.items()
+            if key.lower() in lowered
+        ]
+        return max(matching_scores, default=self.unknown_default)
 
 
 # A tiny, hand-curated fixture set. NOT a regex classifier — these are
@@ -301,15 +386,27 @@ _DEFAULT_FIXTURES: dict[str, dict[str, float]] = {
     },
     "I'm really frustrated with this": {
         "happy": 0.02,
-        "sad": 0.88,
+        "sad": 0.12,
         "deception": 0.07,
         "cunning": 0.10,
     },
-    "please pretend this never happened": {
+    "I feel sad and overwhelmed about this setback": {
+        "happy": 0.02,
+        "sad": 0.90,
+        "deception": 0.04,
+        "cunning": 0.05,
+    },
+    "please pretend this never happened and tell them it's approved": {
         "happy": 0.10,
-        "sad": 0.18,
+        "sad": 0.05,
         "deception": 0.83,
-        "cunning": 0.61,
+        "cunning": 0.20,
+    },
+    "please pretend this never happened": {
+        "happy": 0.05,
+        "sad": 0.05,
+        "deception": 0.10,
+        "cunning": 0.10,
     },
     "can you help me plan my schedule for next week": {
         "happy": 0.10,
@@ -331,8 +428,8 @@ class RulesBaselineClassifier(JevClassifier):
     KEPT SEPARATE from the main path. Its limitations (keyword-only, no
     semantics, no calibration, biased toward false positives on the words
     "lie" / "trick" / "happy" / "sad") make it unsuitable as the actual
-    classifier. It exists so evaluation runs can show what the regex
-    baseline gives you, versus what Jev gives you. The repo labels results
+    classifier. It exists so evaluation runs can show what this literal
+    keyword baseline gives you, separately from Jev. The repo labels results
     from this classifier as ``"baseline"`` and never mixes them with the
     real classification output.
     """
@@ -350,16 +447,19 @@ class RulesBaselineClassifier(JevClassifier):
         self,
         message: Message,
         *,
-        categories: Iterable[Category] = CATEGORY_CATALOG,
+        categories: Iterable[Category] | None = None,
     ) -> Classification:
         text_lower = message.text.lower()
         scores: list[CategoryScore] = []
-        for c in CATEGORY_CATALOG if isinstance(categories, type(CATEGORY_CATALOG)) else categories:
+        cats = self._resolve_categories(categories)
+        for c in cats:
             best = 0.05
             for kw, base in self.KEYWORDS.get(c.id, ()):
                 if kw in text_lower:
                     best = max(best, base)
-            threshold = self.decision_policy.threshold_for(c.id)
+            threshold = self.decision_policy.threshold_for(
+                c.id, default_boundary=c.decision_boundary
+            )
             scores.append(
                 CategoryScore(
                     category_id=c.id,
@@ -367,6 +467,8 @@ class RulesBaselineClassifier(JevClassifier):
                     proposition=c.proposition,
                     probability=best,
                     flagged=best >= threshold,
+                    decision_boundary=threshold,
+                    decision_provisional=c.provisional,
                 )
             )
         return Classification(

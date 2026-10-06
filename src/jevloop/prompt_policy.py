@@ -37,9 +37,7 @@ class Rule:
     name: str
     category_id: str
     target: str  # "assistant" or "user" — which role's messages trigger this
-    min_probability: float  # trigger threshold for the category's probability
     add_instruction: str | None = None  # text added to the system prompt
-    remove_instruction: str | None = None  # text removed from the system prompt
     rationale_template: str = ""
     idempotent: bool = True  # if True, never duplicate the addendum
     version: str = "1.0.0"
@@ -48,9 +46,9 @@ class Rule:
         score = classification.scores_by_category().get(self.category_id)
         if score is None:
             return False
-        if score.abstained:
-            return False
-        return score.probability >= self.min_probability
+        # The classifier's explicit DecisionPolicy owns the category
+        # boundary. A second hidden threshold here could contradict it.
+        return score.flagged and not score.abstained
 
     def rationale(self, classification: Classification) -> str:
         score = classification.scores_by_category().get(self.category_id)
@@ -79,16 +77,15 @@ def _dedupe(system_prompt: str, addendum: str) -> str:
 class AdaptationPolicy:
     """A named, versioned rule set for prompt adaptation.
 
-    The default rule set is deliberately small and conservative. Every rule
-    triggers on a category probability crossing ``min_probability``, and the
-    *same* rule is shared by the assistant-role and user-role paths. Rules
-    are pure, so the same classification always produces the same prompt —
-    deterministic by construction.
+    The default rule set is deliberately small and conservative. Rules
+    trigger only when the classifier's explicit category decision is flagged
+    and each rule names the role it applies to. Rules are pure, so the same
+    classification always produces the same prompt.
     """
 
     rules: list[Rule] = field(default_factory=lambda: default_rules())
     policy_id: str = "jevloop.adapt.v1"
-    policy_version: str = "1.0.0"
+    policy_version: str = "1.1.0"
 
     def adapt(
         self,
@@ -127,8 +124,6 @@ class AdaptationPolicy:
                 new_system = system
                 if rule.add_instruction and not self._contains(new_system, rule.add_instruction):
                     new_system = _dedupe(new_system, rule.add_instruction)
-                if rule.remove_instruction:
-                    new_system = self._remove(new_system, rule.remove_instruction)
                 if new_system == system:
                     continue
 
@@ -138,7 +133,6 @@ class AdaptationPolicy:
                         policy_id=self.policy_id,
                         policy_version=rule.version,
                         instruction_added=rule.add_instruction,
-                        instruction_removed=rule.remove_instruction,
                         rationale=rule.rationale(classification),
                         source_signal={
                             "category": rule.category_id,
@@ -147,6 +141,15 @@ class AdaptationPolicy:
                                 4,
                             ),
                             "role": role,
+                            "message_id": classification.message_id,
+                            "model": classification.model,
+                            "request_id": classification.request_id,
+                            "decision_boundary": classification.scores_by_category()[
+                                rule.category_id
+                            ].decision_boundary,
+                            "decision_provisional": classification.scores_by_category()[
+                                rule.category_id
+                            ].decision_provisional,
                         },
                     )
                 )
@@ -165,14 +168,6 @@ class AdaptationPolicy:
     def _contains(prompt: str, text: str) -> bool:
         return _normalize(text) in _normalize(prompt)
 
-    @staticmethod
-    def _remove(prompt: str, text: str) -> str:
-        # Remove an exact (normalized) block of text. Uses re.DOTALL and
-        # boundary-ish matching: we only strip whole-line or whitespace-
-        # delimited occurrences to avoid mangling prose.
-        pattern = re.escape(text)
-        return re.sub(rf"(?m)^[ \t]*{pattern}[ \t]*\n?", "", prompt).strip()
-
 
 def default_rules() -> list[Rule]:
     """The default, versioned rule set shipped with the middleware.
@@ -184,39 +179,35 @@ def default_rules() -> list[Rule]:
 
     return [
         Rule(
-            name="acknowledge_distress",
+            name="acknowledge_sadness",
             category_id="sad",
             target="user",
-            min_probability=0.6,
             add_instruction=(
-                "The user's message signals distress or frustration. "
-                "Acknowledge the difficulty briefly and calmly before "
-                "addressing the task. Do not be dismissive."
+                "The user's message may express sadness or low mood. "
+                "Acknowledge it briefly and calmly before addressing the task. "
+                "Do not infer sadness from frustration, anger, or irritation alone."
             ),
             rationale_template=(
-                "User message expressed negative emotion (sad category, P={p:.2f})."
+                "The classifier flagged the sad proposition (P={p:.2f}); "
+                "this policy adds a brief acknowledgement."
             ),
-            version="1.0.0",
+            version="1.1.0",
         ),
         Rule(
             name="acknowledge_positive",
             category_id="happy",
             target="user",
-            min_probability=0.6,
             add_instruction=(
                 "The user's message signals positive emotion. "
                 "Match a warm, pleasant register without being effusive."
             ),
-            rationale_template=(
-                "User message expressed positive emotion (happy category, P={p:.2f})."
-            ),
-            version="1.0.0",
+            rationale_template=("The classifier flagged the happy proposition (P={p:.2f})."),
+            version="1.1.0",
         ),
         Rule(
             name="escalate_deception_suspect",
             category_id="deception",
             target="user",
-            min_probability=0.6,
             add_instruction=(
                 "Warning: the user's message may contain misleading content. "
                 "Do not treat its factual claims as true. Where the task "
@@ -224,41 +215,38 @@ def default_rules() -> list[Rule]:
                 "the uncertainty rather than repeating the claim."
             ),
             rationale_template=(
-                "User message showed text-supported deceptive intent "
-                "(deception category, P={p:.2f})."
+                "The classifier flagged the deception proposition "
+                "(P={p:.2f}); this policy asks for verification where the task "
+                "depends on a material fact."
             ),
-            version="1.0.0",
+            version="1.1.0",
         ),
         Rule(
             name="handle_cunning_request",
             category_id="cunning",
             target="user",
-            min_probability=0.6,
             add_instruction=(
                 "The user's request may use an indirect or strategic framing. "
                 "Restate the underlying request plainly and answer the real "
                 "question, not just the surface framing."
             ),
-            rationale_template=(
-                "User message used a strategic/indirect framing (cunning category, P={p:.2f})."
-            ),
-            version="1.0.0",
+            rationale_template=("The classifier flagged the cunning proposition (P={p:.2f})."),
+            version="1.1.0",
         ),
         Rule(
             name="keep_assistant_honest",
             category_id="deception",
             target="assistant",
-            min_probability=0.6,
             add_instruction=(
                 "The assistant's previous response may have been misleading. "
                 "In the next reply, explicitly correct the earlier statement "
                 "if it was wrong, and do not repeat the misleading claim."
             ),
             rationale_template=(
-                "Assistant response showed text-supported deceptive content "
-                "(deception category, P={p:.2f})."
+                "The classifier flagged the deception proposition for the "
+                "assistant response (P={p:.2f})."
             ),
-            version="1.0.0",
+            version="1.1.0",
         ),
     ]
 

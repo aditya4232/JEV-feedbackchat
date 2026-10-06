@@ -63,7 +63,9 @@ warn_unused_ignores = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+# Never spend live Jev calls in the default suite, even when a key is present.
+# An explicit `pytest -m live` opts into the bounded smoke test.
+addopts = "-ra --strict-markers -m 'not live'"
 markers = [
     "live: requires TYPESAFE_API_KEY and counts against the live budget",
 ]

@@ -21,7 +21,7 @@ from jevloop.adapter import (
     build_classifier,
 )
 from jevloop.contracts import Message, Role
-from jevloop.taxonomy import CATEGORY_CATALOG, DecisionPolicy
+from jevloop.taxonomy import CATEGORY_CATALOG, Category, DecisionPolicy
 
 # ---------------------------------------------------------------------------
 # Shared contract
@@ -89,6 +89,54 @@ def test_offline_mock_fixture_is_deterministic() -> None:
     assert a.scores_by_category()["happy"].probability == pytest.approx(0.92)
 
 
+def test_offline_mock_labels_ambiguous_pretend_phrase_as_unresolved() -> None:
+    classifier = OfflineMockClassifier(DecisionPolicy())
+    result = classifier.classify(
+        Message(id="m", role="user", text="Please pretend this never happened", turn=0)
+    )
+    assert classifier.mode == "offline"  # deterministic mock, not semantic classification
+    assert result.scores_by_category()["deception"].flagged is False
+
+
+def test_custom_categories_flow_through_classifier() -> None:
+    frustration = Category(
+        id="frustration",
+        label="frustration",
+        kind="emotion",
+        proposition="The message expresses frustration.",
+        decision_boundary=0.7,
+    )
+    classifier = OfflineMockClassifier(
+        DecisionPolicy(),
+        categories=[frustration],
+        fixtures={"annoyed": {"frustration": 0.8}},
+    )
+    result = classifier.classify(Message(id="m", role="user", text="annoyed", turn=0))
+    assert [score.category_id for score in result.scores] == ["frustration"]
+    assert result.scores[0].flagged is True
+
+    fake = _FakeClient(per_category={"frustration": 0.8})
+    live = build_classifier(
+        mode="live",
+        categories=[frustration],
+        client=fake,
+        api_key="fake",
+    )
+    live_result = live.classify(Message(id="live", role="user", text="annoyed", turn=0))
+    assert set(fake.calls[0]["questions"]) == {"frustration"}
+    assert live_result.scores[0].flagged is True
+
+
+@pytest.mark.parametrize(
+    "invalid_probability", [float("nan"), float("inf"), -0.01, 1.01, "0.8", True]
+)
+def test_live_adapter_rejects_invalid_probabilities(invalid_probability: Any) -> None:
+    fake = _FakeClient(per_category={"happy": invalid_probability})
+    classifier = LiveJevClassifier(DecisionPolicy(), api_key="fake", client=fake)
+    with pytest.raises(ClassifierError, match="invalid answer|finite and in "):
+        classifier.classify(Message(id="m", role="user", text="hello", turn=0))
+
+
 # ---------------------------------------------------------------------------
 # build_classifier selection
 # ---------------------------------------------------------------------------
@@ -98,6 +146,15 @@ def test_build_classifier_explicit_modes() -> None:
     assert isinstance(build_classifier(mode="offline"), OfflineMockClassifier)
     assert isinstance(build_classifier(mode="baseline"), RulesBaselineClassifier)
     assert isinstance(build_classifier(mode="live"), LiveJevClassifier)
+
+
+def test_explicit_live_mode_never_downgrades_without_a_key(monkeypatch) -> None:
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    classifier = build_classifier(mode="live")
+
+    assert classifier.mode == "live"
+    with pytest.raises(ClassifierError, match="TYPESAFE_API_KEY"):
+        classifier.classify(Message(id="m", role="user", text="ordinary", turn=0))
 
 
 def test_build_classifier_unknown_mode_raises() -> None:
@@ -113,6 +170,11 @@ def test_build_classifier_auto_prefers_live_when_key_present(monkeypatch) -> Non
 def test_build_classifier_auto_uses_offline_without_key(monkeypatch) -> None:
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     assert isinstance(build_classifier(), OfflineMockClassifier)
+
+
+def test_live_classifier_model_can_be_configured_by_environment(monkeypatch) -> None:
+    monkeypatch.setenv("TYPESAFE_DEFAULT_MODEL", "jev-configured")
+    assert LiveJevClassifier(DecisionPolicy(), api_key="fake").model == "jev-configured"
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +230,37 @@ def test_live_adapter_builds_one_noul_per_category_and_preserves_probabilities()
     assert c.request_id == "req-123"
     assert c.model == "jev-latest"
     assert c.latency_ms >= 0.0
+
+
+def test_live_adapter_passes_bounded_context_as_separate_jev_state() -> None:
+    fake = _FakeClient(per_category={})
+    message = Message(
+        id="m",
+        role="user",
+        text="Please explain the prior reference.",
+        turn=2,
+        metadata={
+            "conversation_context": [
+                {"role": "user", "text": "Previous question"},
+                {"role": "assistant", "text": "Previous answer"},
+            ]
+        },
+    )
+    LiveJevClassifier(DecisionPolicy(), api_key="fake", client=fake).classify(message)
+    state = fake.calls[0]["state"]
+    assert state["text"] == message.text
+    assert state["conversation_context"] == message.metadata["conversation_context"]
+
+
+def test_live_questions_include_taxonomy_guardrails() -> None:
+    fake = _FakeClient(per_category={})
+    classifier = LiveJevClassifier(DecisionPolicy(), api_key="fake", client=fake)
+    classifier.classify(Message(id="m", role="user", text="quoted and negated", turn=0))
+    questions = fake.calls[0]["questions"]
+    assert "do not establish sadness" in questions["sad"].instructions.lower()
+    assert "ambiguous words" in questions["deception"].instructions.lower()
+    assert "quotation" in questions["deception"].instructions.lower()
+    assert "personality trait" in questions["cunning"].instructions.lower()
 
 
 def test_live_adapter_never_normalises_even_when_probs_exceed_one_total() -> None:

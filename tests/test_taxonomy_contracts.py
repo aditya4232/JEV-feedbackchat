@@ -36,8 +36,12 @@ def test_categories_carry_kind_and_proposition() -> None:
     assert "positive" in happy.proposition
     deception = category_by_id("deception")
     assert deception.kind == "behaviour"
-    # The proposition must contain the anti-trivial-evidence clause.
-    assert "merely mentioning" in deception.proposition.lower()
+    # Quotes, admissions, negation, and topic discussion are not enough.
+    assert "truthful admission" in deception.proposition.lower()
+    assert "quotation" in deception.proposition.lower()
+    sad = category_by_id("sad")
+    assert "frustration" in sad.proposition.lower()
+    assert "do not establish sadness" in sad.proposition.lower()
 
 
 def test_probabilities_are_never_normalised_by_contract() -> None:
@@ -97,11 +101,10 @@ def test_unknown_category_raises() -> None:
 
 
 def test_category_catalog_is_extension_point() -> None:
-    """Adding a category means one more Noul, automatically asked.
+    """A caller can extend the default catalog with another category.
 
-    The adapter builds one question per entry in CATEGORY_CATALOG, so this
-    test documents that a new category is picked up without code changes
-    in the loop.
+    The configured classifier builds one question per category, and a caller
+    can attach a matching prompt Rule without editing the core loop.
     """
     extra = Category(
         id="confusion",
@@ -150,11 +153,10 @@ def test_feedback_payload_carries_everything() -> None:
         effective_system_prompt="base\n\n(addendum)",
         addenda=[
             AdaptationStep(
-                name="acknowledge_distress",
+                name="acknowledge_sadness",
                 policy_id="jevloop.adapt.v1",
-                policy_version="1.0.0",
+                policy_version="1.1.0",
                 instruction_added="Be calm.",
-                instruction_removed=None,
                 rationale="sad signal",
                 source_signal={"category": "sad", "probability": 0.8},
             )
@@ -184,7 +186,7 @@ def test_feedback_payload_carries_everything() -> None:
     d = fb.as_dict()
     assert d["next_turn_feedback"] == {"sad": 0.8}
     assert d["should_revise"] is True
-    assert d["adapted_prompt"]["addenda"][0]["name"] == "acknowledge_distress"
+    assert d["adapted_prompt"]["addenda"][0]["name"] == "acknowledge_sadness"
 
 
 def test_generator_output_can_carry_revision_relationship() -> None:

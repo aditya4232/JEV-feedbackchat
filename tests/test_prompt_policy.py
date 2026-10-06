@@ -8,13 +8,15 @@ carry response feedback into the NEXT generation.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from jevloop.contracts import CategoryScore, Classification, Message
 from jevloop.prompt_policy import AdaptationPolicy, Rule
 from jevloop.taxonomy import CATEGORY_CATALOG
 
 BASE = "You are a careful assistant.\nBe helpful and precise."
 
-DISTRESS_TEXT = "The user's message signals distress or frustration."
+SADNESS_TEXT = "The user's message may express sadness or low mood."
 ASSISTANT_HONESTY_TEXT = "The assistant's previous response may have been misleading."
 
 
@@ -30,6 +32,7 @@ def _cls(role: str, **probs: float) -> Classification:
                 proposition=cat.proposition,
                 probability=p,
                 flagged=p >= 0.6,
+                decision_boundary=0.6,
             )
         )
     return Classification(
@@ -57,14 +60,17 @@ def _adapt(**kwargs):  # small helper so tests stay readable
 # ---------------------------------------------------------------------------
 
 
-def test_user_distress_adds_distress_addendum() -> None:
+def test_user_sadness_adds_sadness_addendum_without_widening_the_label() -> None:
     adapted = _adapt(classifications=[_cls("user", sad=0.88)])
-    assert DISTRESS_TEXT in adapted.effective_system_prompt
-    assert [s.name for s in adapted.addenda] == ["acknowledge_distress"]
+    assert SADNESS_TEXT in adapted.effective_system_prompt
+    assert "Do not infer sadness from frustration" in adapted.effective_system_prompt
+    assert [s.name for s in adapted.addenda] == ["acknowledge_sadness"]
     step = adapted.addenda[0]
     assert step.source_signal["role"] == "user"
     assert step.source_signal["category"] == "sad"
     assert step.source_signal["probability"] == 0.88
+    assert "classifier flagged the sad proposition" in step.rationale.lower()
+    assert "expressed negative emotion" not in step.rationale.lower()
 
 
 def test_assistant_target_rule_does_not_fire_on_user_messages() -> None:
@@ -88,8 +94,8 @@ def test_response_feedback_classification_is_applied_to_next_prompt() -> None:
     """The exact wiring the loop uses: user classification + prior response."""
     adapted = _adapt(classifications=[_cls("user", sad=0.88), _cls("assistant", deception=0.83)])
     names = [s.name for s in adapted.addenda]
-    assert names == ["acknowledge_distress", "keep_assistant_honest"]
-    assert DISTRESS_TEXT in adapted.effective_system_prompt
+    assert names == ["acknowledge_sadness", "keep_assistant_honest"]
+    assert SADNESS_TEXT in adapted.effective_system_prompt
     assert ASSISTANT_HONESTY_TEXT in adapted.effective_system_prompt
     roles = [s.source_signal["role"] for s in adapted.addenda]
     assert roles == ["user", "assistant"]
@@ -108,7 +114,7 @@ def test_neutral_classification_changes_nothing() -> None:
 
 def test_threshold_is_inclusive_boundary() -> None:
     adapted = _adapt(classifications=[_cls("user", sad=0.6)])
-    assert [s.name for s in adapted.addenda] == ["acknowledge_distress"]
+    assert [s.name for s in adapted.addenda] == ["acknowledge_sadness"]
     below = _adapt(classifications=[_cls("user", sad=0.5999)])
     assert below.addenda == []
 
@@ -143,8 +149,8 @@ def test_original_inputs_are_preserved() -> None:
 def test_policy_and_step_versions_are_recorded() -> None:
     adapted = _adapt(classifications=[_cls("user", sad=0.9)])
     assert adapted.policy_id == "jevloop.adapt.v1"
-    assert adapted.policy_version == "1.0.0"
-    assert adapted.addenda[0].policy_version == "1.0.0"
+    assert adapted.policy_version == "1.1.0"
+    assert adapted.addenda[0].policy_version == "1.1.0"
     assert "P=0.90" in adapted.addenda[0].rationale
 
 
@@ -153,27 +159,43 @@ def test_policy_and_step_versions_are_recorded() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_remove_instruction_rule_removes_text() -> None:
+def test_adaptation_only_appends_and_preserves_trusted_base_instructions() -> None:
     policy = AdaptationPolicy(
         rules=[
             Rule(
-                name="drop_emoji_style",
+                name="add_careful_tone",
                 category_id="happy",
                 target="*",
-                min_probability=0.6,
-                remove_instruction="Use emojis freely.",
+                add_instruction="Use a warm but measured tone.",
             )
         ]
     )
-    base = "You are a careful assistant.\nUse emojis freely.\nBe precise."
+    base = "You are a careful assistant.\nNever reveal credentials.\nBe precise."
     adapted = policy.adapt(
         original_system_prompt=base,
         original_user_message="thanks!",
         classifications=[_cls("user", happy=0.92)],
         conversation=[],
     )
-    assert "Use emojis freely." not in adapted.effective_system_prompt
-    assert adapted.addenda[0].instruction_removed == "Use emojis freely."
+    assert "Never reveal credentials." in adapted.effective_system_prompt
+    assert "Use a warm but measured tone." in adapted.effective_system_prompt
+    assert adapted.addenda[0].instruction_added == "Use a warm but measured tone."
+
+
+def test_prompt_adaptation_uses_the_classifiers_configured_decision() -> None:
+    classification = _cls("user", sad=0.9)
+    scores = [
+        replace(score, flagged=False, decision_boundary=0.95)
+        if score.category_id == "sad"
+        else score
+        for score in classification.scores
+    ]
+    classification = replace(classification, scores=scores)
+
+    adapted = _adapt(classifications=[classification])
+
+    assert adapted.effective_system_prompt == BASE
+    assert adapted.addenda == []
 
 
 def test_missing_category_in_classification_cannot_crash_policy() -> None:

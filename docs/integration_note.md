@@ -1,71 +1,77 @@
-# Host integration note
+# Bahulam integration proposal
 
-**Status: design note, not a deployed integration.** This middleware has
-not been run inside any live agent host, and no plugin wrapper is shipped.
-Everything below uses only mechanisms that plugin-capable hosts typically
-document, and nothing here claims otherwise.
+**Status: proposal only.** The core middleware works in its CLI and tests;
+no Bahulam plugin wrapper has been implemented or run in Bahulam.
 
-## Why the host has to call the middleware
+## Verified extension points and the message boundary
 
-Plugin systems generally let you ship tools, agents, workspace views, MCP
-servers and a shared key/value store (a "blackboard"). What they do *not*
-typically guarantee is an automatic before-generation / after-generation
-hook that sees every message. Plugin tools run when something invokes
-them, and config/reference files are not automatically injected into model
-context.
+The published [plugin overview](https://docs.bahulam.ai/plugins) describes
+client-side callable tools, agents, workspace views, and plugin state. The
+[plugin creation guide](https://docs.bahulam.ai/plugins/create) documents
+`plugin.yaml`, ES-module tool handlers, agent configuration, and workspace
+views. The [MCP guide](https://docs.bahulam.ai/plugins/mcp) documents Python
+and other-language MCP tool servers. The
+[shared-blackboard guide](https://docs.bahulam.ai/plugins/shared-blackboard)
+documents persistent state through `options.state` and view-side access.
 
-That matters here: the assignment requires that *every* complete user
-message and *every* assistant response is classified. A plugin alone
-cannot promise that. So the integration is host-side:
+Those pages describe tools that run when called, agents that can be invoked,
+and state shared by a handler and view. The reviewed pages do not document an
+automatic before-generation/after-generation hook that observes every chat
+message. A Bahulam host orchestrator must therefore invoke this middleware
+at both boundaries if it needs the assignment's every-message behavior:
 
-- **before generation** — classify the user message, adapt the system
-  prompt, then generate;
-- **after generation** — classify the assistant response, build feedback,
-  store it, and hand it to the next generation.
+1. **Before generation:** pass the complete user message and bounded history
+   to the loop. It classifies the user message, appends applicable named
+   instructions to the trusted base system prompt, and gives that exact
+   effective prompt plus the unchanged user request to the generator.
+2. **After generation:** classify the complete assistant response and retain
+   the structured feedback. On the next generation, include the prior
+   assistant classification so the policy can adapt that prompt.
 
-The middleware does the classifying, the policy work and the bookkeeping.
-The host just has to call it at those two moments.
+The plugin contract does not automatically intercept either boundary.
+Calling a tool from an agent only classifies the message explicitly passed to
+that tool.
 
-## Pattern A — let the loop own one turn
+## Core agent-facing contract
 
-Simplest case: the host hands the middleware the user text and a generator
-callable, and reads the result.
+The host can delegate one full turn to the reusable Python loop:
 
 ```python
-from jevloop import FeedbackLoop, build_classifier
+from jevloop import FeedbackLoop, build_classifier, build_generator
 
 loop = FeedbackLoop(
-    classifier=build_classifier(),          # live if TYPESAFE_API_KEY is set, else mock
+    classifier=build_classifier(mode="live"),
     base_system_prompt="You are a helpful support agent. ...",
 )
+generator = build_generator(mode="openai-compatible")  # explicit app API config
 
 result = loop.run_turn(
     user_text,
-    generator=lambda effective_prompt, feedback: my_llm(
-        system=effective_prompt.system_prompt,
-        user=effective_prompt.user_message,
-        context=feedback,                    # {"feedback": {...}} from the previous turn
-    ),
+    generator=generator,
 )
 
-# what to remember for the next turn:
-result.next_turn_feedback    # {"source_message_id", "source_role", "flagged", "scores", ...}
+# The next loop turn consumes the response classification and this payload.
+result.next_turn_feedback
 result.response_classification
 ```
 
-- The generator receives the exact `EffectivePrompt` the policy built —
-  there is no second prompt-assembly path.
-- `result.next_turn_feedback` is the compact, machine-readable feedback
-  from the assistant response that just happened (flagged categories with
-  rounded probabilities, source message id/role, model, request id).
+- The generator receives the exact `EffectivePrompt` the policy built; the
+  integration test checks the prompt passed on the next generation.
+- `OpenAICompatibleGenerator` sends the current request verbatim and includes
+  only bounded recent history. Configure a real provider endpoint and API
+  credentials explicitly; chat-product subscriptions are not assumed to
+  provide application API access.
+- The feedback records the source message id and role, per-category
+  probabilities, decisions, classifier model and request id. Revision links
+  are explicit, and revised assistant messages are classified too.
 - The loop also offers `run_turn_for_message()` if the host already
   builds `Message` objects, and a `revision_callback` if it wants the
   middleware to ask for a corrected reply when a response flags badly.
 
-## Pattern B — the host owns generation
+## Pattern B — adapt an existing host generation path
 
-If the host already has its own generation pipeline and just wants the
-signals, call the pieces directly:
+If the host keeps its own model client, invoke the classifier and policy
+before calling that client, then classify its complete response:
 
 ```python
 from jevloop import AdaptationPolicy, Message, build_classifier
@@ -97,28 +103,15 @@ response_classification = classifier.classify(assistant_msg)
 last_response_classification = response_classification
 ```
 
-One honest caveat: the compact `next_turn_feedback` dict is assembled by
-`FeedbackLoop.run_turn` (see `src/jevloop/loop.py`, `_next_turn_feedback_for`).
-If you own generation, you can mirror that shape from
-`response_classification.scores` (flag every score whose `.flagged` is
-true), or just use Pattern A, which does it for you. The full
-`FeedbackPayload` — classification + adapted prompt + revision decision —
-is also only produced by Pattern A.
-
-## What a host plugin could add (optional, unshipped)
-
-If you want the loop visible from inside a plugin-capable host, the
-mechanisms that fit are:
-
-1. **Tools** — expose `classify_message` / `build_feedback` as plugin
-   tools, most cleanly through a small MCP server (the core is Python).
-2. **Blackboard** — append one record per turn
-   (`state.append("turns", {...})`) so a workspace view can inspect
-   classifications, prompts and feedback live.
-3. **Workspace view** — render the transcript review from those records.
-
-None of this is shipped or validated against a live host; it is listed so
-the mapping from this repo to a real deployment is explicit.
+For a Bahulam plugin wrapper, a proposal consistent with the published
+mechanisms is a Python MCP server exposing the middleware as a callable tool,
+plus a JavaScript handler using `options.state.append("turns", record)` for
+persistent review data and an optional workspace view. The manifest would
+declare the MCP server and tool allowlist as documented. This wrapper would
+make the capability callable and inspectable. It would still **not** create
+automatic message interception; the host orchestrator must call it before
+and after generation. No plugin manifest, handler, MCP server, or Bahulam
+backend change is included here.
 
 ## Operational notes
 
@@ -130,10 +123,11 @@ the mapping from this repo to a real deployment is explicit.
 - **Credentials:** `TYPESAFE_API_KEY` comes from the environment (see
   `.env.example`); there is no key in the repo.
 - **No silent downgrade:** if live mode is requested and the SDK or key is
-  missing, the code raises; it never quietly falls back to the mock.
-- **Revision:** enabled by default, threshold `0.7` on deception/sad for
-  the *assistant* message. A host can disable it or supply its own
-  `revision_callback`.
-- **Provenance:** policy id, policy version, model and request id travel
-  with every recorded adaptation and feedback item, so a host can pin and
-  audit behaviour later.
+  missing, classification raises; it never quietly falls back to the mock.
+- **Revision:** the decision check is enabled by default at `0.7` and also
+  requires the configured deception category decision to be flagged. No
+  revision happens unless the host supplies a `revision_callback`. Assistant
+  sadness or empathy does not automatically request revision.
+- **Provenance:** each score records its boundary and provisional status;
+  adaptations record policy version, signal, source message, model and
+  request id.

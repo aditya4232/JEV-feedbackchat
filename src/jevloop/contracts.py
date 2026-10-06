@@ -8,6 +8,7 @@ core middleware actually middleware-shaped, rather than a script.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -29,8 +30,24 @@ class Message:
     revision_of: str | None = None  # message.id this one revises
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise ValueError("message id must be a non-empty string")
+        if self.role not in ("user", "assistant", "system"):
+            raise ValueError(f"unsupported message role: {self.role!r}")
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("message text must be a non-empty string")
+        if isinstance(self.turn, bool) or not isinstance(self.turn, int) or self.turn < 0:
+            raise ValueError("message turn must be a non-negative integer")
+        if self.revision_of is not None and (
+            not isinstance(self.revision_of, str) or not self.revision_of.strip()
+        ):
+            raise ValueError("revision_of must be a non-empty message id when provided")
+        if not isinstance(self.metadata, dict):
+            raise ValueError("message metadata must be a dictionary")
 
-@dataclass
+
+@dataclass(frozen=True)
 class CategoryScore:
     category_id: str
     label: str
@@ -38,6 +55,45 @@ class CategoryScore:
     probability: float  # P(this proposition holds for this message)
     flagged: bool  # probability >= DecisionPolicy.threshold_for(category_id)
     abstained: bool = False  # classifier chose not to commit (e.g. ambiguous)
+    decision_boundary: float | None = None
+    decision_provisional: bool = True
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.category_id, str)
+            or not self.category_id.strip()
+            or not isinstance(self.label, str)
+            or not self.label.strip()
+            or not isinstance(self.proposition, str)
+            or not self.proposition.strip()
+        ):
+            raise ValueError("category score id, label and proposition must be non-empty")
+        if (
+            isinstance(self.probability, bool)
+            or not isinstance(self.probability, (int, float))
+            or not math.isfinite(self.probability)
+            or not 0.0 <= self.probability <= 1.0
+        ):
+            raise ValueError("category probability must be finite and in [0,1]")
+        if not isinstance(self.flagged, bool) or not isinstance(self.abstained, bool):
+            raise ValueError("flagged and abstained must be booleans")
+        if self.flagged and self.abstained:
+            raise ValueError("an abstained category cannot be flagged")
+        if self.decision_boundary is not None and (
+            isinstance(self.decision_boundary, bool)
+            or not isinstance(self.decision_boundary, (int, float))
+            or not math.isfinite(self.decision_boundary)
+            or not 0.0 <= self.decision_boundary <= 1.0
+        ):
+            raise ValueError("decision_boundary must be finite and in [0,1]")
+        if not isinstance(self.decision_provisional, bool):
+            raise ValueError("decision_provisional must be a boolean")
+        if self.decision_boundary is not None:
+            expected_flag = not self.abstained and self.probability >= self.decision_boundary
+            if self.flagged != expected_flag:
+                raise ValueError(
+                    "flagged must match probability, abstention, and decision_boundary"
+                )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -47,6 +103,8 @@ class CategoryScore:
             "probability": round(self.probability, 4),
             "flagged": self.flagged,
             "abstained": self.abstained,
+            "decision_boundary": self.decision_boundary,
+            "decision_provisional": self.decision_provisional,
         }
 
 
@@ -54,10 +112,8 @@ class CategoryScore:
 class Classification:
     """Result of classifying one message with Jev.
 
-    Probabilities are NOT normalised. They are independent propositions and
-    can sum to anything.  ``confidence`` (when available) is Jev's own
-    per-question confidence, kept distinct from ``probability`` because the
-    two are not the same thing.
+    Probabilities are NOT normalised. Each value is the Noul probability of
+    its own proposition; multiple categories may be true at once.
     """
 
     message_id: str
@@ -82,6 +138,7 @@ class Classification:
             "request_id": self.request_id,
             "latency_ms": round(self.latency_ms, 2),
             "scores": [s.as_dict() for s in self.scores],
+            "raw_answers": self.raw_answers,
             "flagged": self.flagged_categories(),
         }
 
@@ -94,15 +151,12 @@ class AdaptationStep:
     WHAT changed, WHY it changed, and the SOURCE signal that triggered it.
     """
 
-    name: str  # e.g. "acknowledge_distress"
+    name: str  # e.g. "acknowledge_sadness"
     policy_id: str  # e.g. "jevloop.adapt.v1"
     policy_version: str  # e.g. "1.0.0"
     instruction_added: str | None
-    instruction_removed: str | None
     rationale: str  # human-readable: which Jev signal triggered this
-    source_signal: dict[
-        str, Any
-    ]  # machine-readable: e.g. {"category": "sad", "p": 0.81}
+    source_signal: dict[str, Any]  # machine-readable category id, score, and message role
 
 
 @dataclass
@@ -131,7 +185,6 @@ class AdaptedPrompt:
                 {
                     "name": s.name,
                     "added": s.instruction_added,
-                    "removed": s.instruction_removed,
                     "rationale": s.rationale,
                     "source_signal": s.source_signal,
                 }

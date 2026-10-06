@@ -17,6 +17,7 @@ Design rules (from the assignment):
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -43,6 +44,20 @@ class Category:
     decision_boundary: float  # P(proposition) >= this  ->  category flagged
     provisional: bool = True  # thresholds are provisional until calibrated
 
+    def __post_init__(self) -> None:
+        if not CATEGORY_ID.fullmatch(self.id):
+            raise ValueError(f"Invalid category id {self.id!r}")
+        if self.kind not in ("emotion", "intent", "behaviour"):
+            raise ValueError(f"Invalid category kind {self.kind!r}")
+        if not self.label.strip() or not self.proposition.strip():
+            raise ValueError("category label and proposition must be non-empty")
+        if (
+            isinstance(self.decision_boundary, bool)
+            or not math.isfinite(self.decision_boundary)
+            or not 0.0 <= self.decision_boundary <= 1.0
+        ):
+            raise ValueError("decision_boundary must be finite and in [0,1]")
+
 
 CATEGORY_CATALOG: tuple[Category, ...] = (
     Category(
@@ -60,8 +75,10 @@ CATEGORY_CATALOG: tuple[Category, ...] = (
         label="sad",
         kind="emotion",
         proposition=(
-            "The message expresses negative emotion such as disappointment, "
-            "frustration, distress, or a generally unhappy tone."
+            "The message expresses sadness, grief, or low mood; clear "
+            "disappointment may qualify when it conveys sadness. Frustration, "
+            "anger, annoyance, or fatigue alone do not establish sadness, and "
+            "sympathy for someone else is not the speaker expressing sadness."
         ),
         decision_boundary=0.6,
     ),
@@ -70,11 +87,13 @@ CATEGORY_CATALOG: tuple[Category, ...] = (
         label="deception",
         kind="behaviour",
         proposition=(
-            "The message is intended to mislead the addressee about a material "
-            "fact (e.g. a false claim presented as true, or an attempt to hide "
-            "a material fact). Merely mentioning, quoting, or hypothetically "
-            "discussing deception is not enough; the text must itself attempt "
-            "to deceive in this utterance."
+            "In the available context, the message requests, plans, endorses, "
+            "or performs an attempt to mislead someone about a material fact "
+            "or conceal a material fact. Do not infer deception from ambiguous "
+            "words such as 'pretend' or 'hide' without context identifying the "
+            "false claim or material concealment. A truthful admission of past "
+            "deception, quotation, negation, hypothetical, or discussion of "
+            "deception is not itself an attempt to deceive."
         ),
         decision_boundary=0.6,
     ),
@@ -83,10 +102,11 @@ CATEGORY_CATALOG: tuple[Category, ...] = (
         label="cunning",
         kind="behaviour",
         proposition=(
-            "The message uses a strategic, indirect, or deceptive-adjacent "
-            "manipulation tactic to steer the addressee (e.g. framing a demand "
-            "as a favor, exploiting sympathy, or concealing the actual goal). "
-            "An ordinary, direct strategic request is not cunning."
+            "The message uses an indirect or manipulative tactic to steer "
+            "someone's decision (e.g. disguising a demand as a favor, exploiting "
+            "sympathy, or concealing the actual goal). A direct false statement "
+            "request, ordinary strategy, or discussion of a personality trait "
+            "does not by itself establish cunning."
         ),
         decision_boundary=0.6,
     ),
@@ -106,17 +126,31 @@ class DecisionPolicy:
     )
     version: str = "0.1.0"
 
-    def threshold_for(self, category_id: str) -> float:
+    def __post_init__(self) -> None:
+        for category_id, boundary in self.boundaries.items():
+            if not CATEGORY_ID.fullmatch(category_id):
+                raise ValueError(f"Invalid category id {category_id!r}")
+            if (
+                isinstance(boundary, bool)
+                or not isinstance(boundary, (int, float))
+                or not math.isfinite(boundary)
+                or not 0.0 <= boundary <= 1.0
+            ):
+                raise ValueError(f"boundary for {category_id!r} must be finite and in [0,1]")
+
+    def threshold_for(self, category_id: str, *, default_boundary: float | None = None) -> float:
         try:
             return self.boundaries[category_id]
         except KeyError:
+            if default_boundary is not None:
+                return default_boundary
             raise ValueError(
                 f"Unknown category id {category_id!r}. Known: {sorted(self.boundaries)}"
             ) from None
 
     def with_override(self, category_id: str, boundary: float) -> DecisionPolicy:
-        if not 0.0 <= boundary <= 1.0:
-            raise ValueError("boundary must be in [0,1]")
+        if isinstance(boundary, bool) or not math.isfinite(boundary) or not 0.0 <= boundary <= 1.0:
+            raise ValueError("boundary must be finite and in [0,1]")
         merged = dict(self.boundaries)
         merged[category_id] = boundary
         return DecisionPolicy(boundaries=merged, version=self.version)
