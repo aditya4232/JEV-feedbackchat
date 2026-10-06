@@ -4,7 +4,7 @@
 
 Environment: Windows 11 (build 26300), Windows PowerShell 5.1.26100.9549,
 Python 3.12.13, uv 0.11.24, Git 2.55.0.windows.1, typesafe-sdk 0.7.2.
-Author: Aditya Shenvi. No deployment or interviewer contact occurred.
+Author: Aditya Shenvi. No deployment or external contact occurred.
 
 | Command | Actual result |
 |---|---|

@@ -4,7 +4,7 @@
 and assistant messages with Jev, returning structured feedback, and adapting
 the instructions actually consumed by an agent generator.
 
-The interview requirements are Jev classification for both roles, extensible
+The core requirements are Jev classification for both roles, extensible
 categories (happy, sad, deception, cunning), feedback-driven prompt rephrasing,
 and a Git submission. Python, CLI, deterministic policies and the evaluation
 set are implementation choices. No deployment is required.
