@@ -89,6 +89,13 @@ def test_offline_mock_fixture_is_deterministic() -> None:
     assert a.scores_by_category()["happy"].probability == pytest.approx(0.92)
 
 
+def test_offline_unseen_input_is_explicitly_unknown() -> None:
+    result = OfflineMockClassifier(DecisionPolicy()).classify(
+        Message(id="u", role="user", text="unseen arbitrary request", turn=0)
+    )
+    assert all(score.abstained and not score.flagged for score in result.scores)
+
+
 def test_offline_mock_labels_ambiguous_pretend_phrase_as_unresolved() -> None:
     classifier = OfflineMockClassifier(DecisionPolicy())
     result = classifier.classify(

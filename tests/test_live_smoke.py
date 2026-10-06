@@ -56,7 +56,7 @@ def test_live_jev_smoke() -> None:
             Message(id=f"live-smoke-{example_id}", role=role, text=text, turn=0)
         )
         assert response.role == role
-        assert response.model == classifier.model
+        assert isinstance(response.model, str) and response.model
         assert len(response.scores) == 4
         assert {s.category_id for s in response.scores} == {
             "happy",

@@ -225,3 +225,15 @@ def test_conversation_argument_is_accepted_but_not_mutated() -> None:
     snapshot = list(conversation)
     _adapt(classifications=[_cls("user", sad=0.9)], conversation=conversation)
     assert conversation == snapshot
+
+
+def test_base_instructions_are_preserved_including_whitespace() -> None:
+    base = "  Trusted constraints.\n  "
+    adapted = AdaptationPolicy().adapt(
+        original_system_prompt=base,
+        original_user_message="original request",
+        classifications=[_cls("user", sad=0.9)],
+        conversation=[],
+    )
+    assert adapted.effective_system_prompt.startswith(base)
+    assert adapted.original_user_message == "original request"

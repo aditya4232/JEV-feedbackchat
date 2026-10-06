@@ -130,6 +130,12 @@ def test_response_feedback_updates_next_prompt() -> None:
     assert gen.calls[1][0] is second.generator_input
     assert gen.calls[1][0].system_prompt == second.adapted_user_prompt.effective_system_prompt
     assert gen.calls[1][0].user_message == NEUTRAL
+    assert [(m.role, m.text) for m in gen.calls[1][0].conversation] == [
+        ("user", NEUTRAL),
+        ("assistant", DECEPTIVE_RESPONSE),
+    ]
+    assert gen.calls[1][1]["user_classification"] == second.user_classification.as_dict()
+    assert gen.calls[1][0].system_prompt.startswith(BASE)
 
     # The consumed feedback payload (second arg) carries turn 1's signal.
     consumed = gen.calls[1][1]["feedback"]
@@ -282,3 +288,26 @@ def test_transcript_records_the_prompt_the_generator_saw(tmp_path: Path) -> None
     assert record_1["generator_input"]["system_prompt"] == first.generator_input.system_prompt
     assert record_2["generator_input"]["system_prompt"] == second.generator_input.system_prompt
     assert record_2["adapted_user_prompt"]["addenda"][0]["name"] == "acknowledge_sadness"
+
+
+def test_deceptive_revision_is_classified_once_and_loop_stops() -> None:
+    scripted = _ScriptedClassifier(DECEPTIVE_RESPONSE, {"deception": 0.91})
+    loop = _make_loop(classifier=scripted)
+    calls: list[str] = []
+
+    def revise(text: str) -> str:
+        calls.append(text)
+        return DECEPTIVE_RESPONSE
+
+    result = loop.run_turn(
+        NEUTRAL, generator=_Recorder([DECEPTIVE_RESPONSE]), revision_callback=revise
+    )
+    assert calls == [DECEPTIVE_RESPONSE]
+    assert len(result.revised_response_classifications) == 1
+    assert len(scripted.messages) == 3
+    assert (
+        result.revised_response_classifications[0].scores_by_category()["deception"].probability
+        == 0.91
+    )
+    assert result.revised_response_classifications[0].scores_by_category()["deception"].flagged
+    assert result.assistant_messages[1].revision_of == result.assistant_messages[0].id

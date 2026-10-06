@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Real Jev integration. Pinned to a known-good range for the System One API.
+# Real Jev integration. Exact SDK version is recorded in uv.lock for the System One API.
 live = [
     "typesafe-sdk>=0.7.2",
 ]

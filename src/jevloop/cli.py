@@ -1,27 +1,8 @@
-"""5-minute CLI demonstration of the full feedback loop.
+"""Reviewer demonstration of complete-message classification and prompt feedback.
 
-Run (offline, no API key needed):
-
-    uv run jevloop
-
-or with a real Jev key:
-
-    uv run jevloop --mode live
-
-The four default conversation turns below exercise every path:
-
-1. a grateful, benign request  (-happy -> "acknowledge_positive" is added)
-2. a deception-smoking request (-deception, -cunning -> "escalate_deception_suspect"
-   + "handle_cunning_request" are added). Its response is deliberately left
-   unrevised so it still flags when classified.
-3. a plain follow-up, whose adapted prompt picks up "keep_assistant_honest"
-   from turn 2's flagged response — response feedback changing the next
-   generation.
-4. a sadness signal (-sad -> "acknowledge_sadness"); assistant sadness alone
-   does not request revision.
-
-Stop conditions (max calls, live budget) live in the evaluator; this demo
-makes one classification call per side of every turn.
+The default four synthetic turns exercise deterministic mock plumbing.
+Use --message repeatedly for custom input and --mode live for Jev.
+Classifier and generator modes are configured and labelled independently.
 """
 
 from __future__ import annotations
@@ -40,7 +21,9 @@ from jevloop import (
     build_classifier,
     build_generator,
 )
+from jevloop.adapter import ClassifierError
 from jevloop.contracts import Classification
+from jevloop.generator import GeneratorError
 
 
 def _timeline(
@@ -79,6 +62,16 @@ def _print_loop_result(result: LoopResult) -> None:
         "  generator received adapted prompt: "
         f"{result.generator_input.system_prompt == result.adapted_user_prompt.effective_system_prompt}"
     )
+    print("  actual effective system prompt:\n" + result.generator_input.system_prompt)
+    print(
+        "  bounded conversation: "
+        + json.dumps(
+            [
+                {"id": m.id, "role": m.role, "text": m.text}
+                for m in result.generator_input.conversation
+            ]
+        )
+    )
     print(f"  assistant:       {result.generator_output.text[:120]!r}")
     print(f"  response cats:   {_flag_line(r)}")
     if result.revised_outputs:
@@ -89,6 +82,8 @@ def _print_loop_result(result: LoopResult) -> None:
 
 
 def _flag_line(c: Classification) -> str:
+    if c.scores and all(score.abstained for score in c.scores):
+        return "[unknown / abstained]"
     if not c.flagged_categories():
         return "[none]"
     return " ".join(f"{s.label}={s.probability:.2f}" for s in c.scores if s.flagged)
@@ -103,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--mode",
         choices=("live", "offline", "baseline", "auto"),
-        default="auto",
+        default="offline",
         help="classifier mode (auto = live if TYPESAFE_API_KEY is set, else offline)",
     )
     parser.add_argument(
@@ -123,6 +118,11 @@ def main(argv: list[str] | None = None) -> int:
         type=str,
         default=None,
         help="override the base system prompt",
+    )
+    parser.add_argument(
+        "--message",
+        action="append",
+        help="custom complete user message; repeat for subsequent turns in the same session",
     )
     args = parser.parse_args(argv)
 
@@ -177,7 +177,17 @@ def main(argv: list[str] | None = None) -> int:
         ),
     ]
 
-    _timeline(loop, turns, generator)
+    if args.message:
+        turns = [(message, None) for message in args.message]
+    if classifier.mode == "offline":
+        print(
+            "Deterministic mock: unseen phrases get fixed default scores and abstentions, not semantic judgments."
+        )
+    try:
+        _timeline(loop, turns, generator)
+    except (ClassifierError, GeneratorError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     print("Done.")
     print(

@@ -70,7 +70,7 @@ def _normalize(text: str) -> str:
 def _dedupe(system_prompt: str, addendum: str) -> str:
     if _normalize(addendum) in _normalize(system_prompt):
         return system_prompt
-    return f"{system_prompt}\n\n{addendum}".strip()
+    return f"{system_prompt}\n\n{addendum}"
 
 
 @dataclass

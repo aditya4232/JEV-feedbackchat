@@ -165,7 +165,7 @@ class AdaptedPrompt:
 
     ``effective_system_prompt`` is what the generator will actually see. The
     ORIGINAL user message, task, and trusted base instructions are preserved
-    (we only add or remove named addenda; we never rewrite the body of the
+    (we only append named addenda; we never rewrite the body of the
     user message itself).
     """
 

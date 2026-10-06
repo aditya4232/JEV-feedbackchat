@@ -26,6 +26,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from .contracts import CategoryScore, Classification, Message, Role
+from .deadline import validate_deadline, within_deadline
 from .taxonomy import CATEGORY_CATALOG, Category, DecisionPolicy
 
 # ---------------------------------------------------------------------------
@@ -130,8 +131,19 @@ class LiveJevClassifier(JevClassifier):
         model: str | None = None,
         client: Any = None,  # pre-built typesafe_sdk.TypeSafeClient
         categories: Iterable[Category] = CATEGORY_CATALOG,
+        deadline_seconds: float = 30.0,
+        max_retries: int = 0,
     ):
         super().__init__(decision_policy, categories)
+        validate_deadline(deadline_seconds)
+        if (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or not 0 <= max_retries <= 2
+        ):
+            raise ValueError("max_retries must be an integer between 0 and 2")
+        self.deadline_seconds = deadline_seconds
+        self.max_retries = max_retries
         self.api_key = api_key or os.environ.get("TYPESAFE_API_KEY")
         self.base_url = base_url or os.environ.get("TYPESAFE_BASE_URL")
         self.model = model or os.environ.get("TYPESAFE_DEFAULT_MODEL", "jev-latest")
@@ -155,7 +167,12 @@ class LiveJevClassifier(JevClassifier):
         kwargs: dict[str, Any] = {"api_key": self.api_key, "model": self.model}
         if self.base_url:
             kwargs["base_url"] = self.base_url
-        self._client = TypeSafeClient(**kwargs)
+        try:
+            self._client = TypeSafeClient(**kwargs)
+        except Exception as exc:
+            raise ClassifierError(
+                f"Jev client configuration failed ({type(exc).__name__})"
+            ) from None
         return self._client
 
     def classify(
@@ -166,7 +183,7 @@ class LiveJevClassifier(JevClassifier):
     ) -> Classification:
         cats = self._resolve_categories(categories)
         try:
-            from typesafe_sdk import Noul
+            from typesafe_sdk import Noul, RetryPolicy
         except ImportError as e:
             raise ClassifierError(
                 "typesafe-sdk is not installed. Run `uv sync --extra live` "
@@ -179,7 +196,15 @@ class LiveJevClassifier(JevClassifier):
 
         started = time.perf_counter()
         try:
-            result = client.system_one(state, questions)
+            result = within_deadline(
+                lambda: client.system_one(
+                    state,
+                    questions,
+                    timeout=self.deadline_seconds,
+                    retry=RetryPolicy(max_retries=self.max_retries, timeout=self.deadline_seconds),
+                ),
+                self.deadline_seconds,
+            )
         except Exception as e:  # typesafe_sdk raises TypeSafeAPIError etc.
             raise ClassifierError(f"Jev call failed ({type(e).__name__})") from None
         latency_ms = (time.perf_counter() - started) * 1000.0
@@ -236,7 +261,7 @@ class LiveJevClassifier(JevClassifier):
         return Classification(
             message_id=message.id,
             role=message.role,
-            model=self.model,
+            model=getattr(result, "model", None) or self.model,
             request_id=_safe_request_id(result),
             scores=scores,
             raw_answers=raw,
@@ -328,6 +353,7 @@ class OfflineMockClassifier(JevClassifier):
         cats = self._resolve_categories(categories)
         scores: list[CategoryScore] = []
         raw: dict[str, Any] = {}
+        unmatched = not any(key.lower() in message.text.lower() for key in self.fixtures)
         for c in cats:
             p = self._score(c.id, message.text, message.role)
             if not math.isfinite(p) or not 0.0 <= p <= 1.0:
@@ -337,15 +363,15 @@ class OfflineMockClassifier(JevClassifier):
             threshold = self.decision_policy.threshold_for(
                 c.id, default_boundary=c.decision_boundary
             )
-            raw[c.id] = {"noul": p, "abstained": False}
+            raw[c.id] = {"noul": p, "abstained": unmatched}
             scores.append(
                 CategoryScore(
                     category_id=c.id,
                     label=c.label,
                     proposition=c.proposition,
                     probability=p,
-                    flagged=p >= threshold,
-                    abstained=False,
+                    flagged=(not unmatched) and p >= threshold,
+                    abstained=unmatched,
                     decision_boundary=threshold,
                     decision_provisional=c.provisional,
                 )

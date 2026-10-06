@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Five-minute offline demo of jev-feedbackchat. No API key needed.
-# Run from anywhere:  bash examples/five_minute_demo.sh
+# From the repository root in a Unix shell: bash examples/five_minute_demo.sh
+# Optional; not verified in the Windows submission audit. Use the PowerShell script on Windows.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

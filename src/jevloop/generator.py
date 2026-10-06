@@ -14,11 +14,18 @@ from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .contracts import EffectivePrompt, GeneratorOutput
+from .deadline import within_deadline
 
 MAX_RESPONSE_BYTES = 1_000_000
+
+
+class _NoRedirects(HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        # Never forward the application credential to a redirected endpoint.
+        return None
 
 
 class GeneratorError(RuntimeError):
@@ -74,7 +81,7 @@ class OpenAICompatibleGenerator:
         self.max_history_messages = max_history_messages
         self.max_history_chars = max_history_chars
         self.max_tokens = max_tokens
-        self._opener = opener or urlopen
+        self._opener = opener or build_opener(_NoRedirects()).open
 
     @staticmethod
     def _validate_base_url(base_url: str) -> str:
@@ -123,9 +130,12 @@ class OpenAICompatibleGenerator:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request = Request(self.endpoint, data=body, headers=headers, method="POST")
 
-        try:
+        def request_response() -> bytes:
             with self._opener(request, timeout=self.timeout_seconds) as response:
-                response_bytes = response.read(MAX_RESPONSE_BYTES + 1)
+                return bytes(response.read(MAX_RESPONSE_BYTES + 1))
+
+        try:
+            response_bytes = within_deadline(request_response, self.timeout_seconds)
         except HTTPError as exc:
             status = exc.code
             exc.close()

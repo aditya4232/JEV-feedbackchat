@@ -1,12 +1,12 @@
 """Offline/live evaluation runner for jevloop classifiers.
 
-Runs a fixed, hand-annotated case file against one classifier mode, computes
+Runs a fixed, provisionally annotated case file against one classifier mode, computes
 per-category precision/recall/F1, prints a table plus mismatches, and writes a
 JSON report under ``evaluation/results/``.
 
 Design rules:
 
-- Labels are HAND-ANNOTATED ground truth (see ``schema.md``); they are never
+- Labels are PROVISIONAL independent annotations (see ``schema.md``); they are never
   produced by the classifier under test.
 - ``offline`` mode is a labelled fixture mock and exists to validate the
   harness end-to-end; its numbers say nothing about Jev quality.
@@ -38,8 +38,9 @@ VALID_ROLES: tuple[str, ...] = ("user", "assistant")
 REPORT_NOTE = (
     "Decision boundaries are provisional (see DecisionPolicy.as_provenance). "
     "The offline classifier is a labelled fixture mock used to validate the "
-    "harness, not a measurement of Jev. This set is small and single-annotator: "
-    "read precision/recall together with support, not accuracy alone."
+    "harness, not a measurement of Jev. This set is small and provisionally annotated: "
+    "read precision/recall together with support. Abstentions are counted as "
+    "unflagged in the binary confusion table and also reported separately."
 )
 
 
@@ -82,10 +83,7 @@ class Confusion:
         return _safe_div(self.tp, self.tp + self.fn)
 
     def f1(self) -> float | None:
-        precision, recall = self.precision(), self.recall()
-        if precision is None or recall is None or precision + recall == 0:
-            return None
-        return 2 * precision * recall / (precision + recall)
+        return _safe_div(2 * self.tp, 2 * self.tp + self.fp + self.fn)
 
     def accuracy(self) -> float | None:
         return _safe_div(self.tp + self.tn, self.tp + self.fp + self.fn + self.tn)
@@ -216,6 +214,10 @@ def evaluate(cases: list[Case], classifier: JevClassifier, *, mode: str) -> dict
                 "labels": case.labels,
                 "predicted": predicted,
                 "probabilities": probabilities,
+                "classification": classification.as_dict(),
+                "abstained": {
+                    category_id: scored[category_id].abstained for category_id in CATEGORY_IDS
+                },
                 "notes": case.notes,
                 "model": classification.model,
                 "request_id": classification.request_id,
@@ -223,6 +225,8 @@ def evaluate(cases: list[Case], classifier: JevClassifier, *, mode: str) -> dict
         )
 
     categories_report = {category_id: cell.as_dict() for category_id, cell in confusion.items()}
+    for category_id, entry in categories_report.items():
+        entry["abstentions"] = sum(row["abstained"][category_id] for row in predictions)
     macro: dict[str, float | None] = {}
     for metric in ("precision", "recall", "f1"):
         values = [
@@ -291,7 +295,7 @@ def format_mismatches(report: dict[str, Any]) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jevloop-eval",
-        description="Evaluate a jevloop classifier against hand-annotated cases.",
+        description="Evaluate a jevloop classifier against provisionally annotated cases.",
     )
     parser.add_argument(
         "--mode",

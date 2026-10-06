@@ -236,7 +236,14 @@ class FeedbackLoop:
         )
 
         # 4. ask the generator to produce the response
-        response = generator(gen_input, {"feedback": dict(self._last_response_feedback)})
+        response = generator(
+            gen_input,
+            {
+                "user_classification": user_classification.as_dict(),
+                "feedback": dict(self._last_response_feedback),
+                "applied_policies": adapted.summary(),
+            },
+        )
         response.id = response.id or f"a{user_msg.turn}-{uuid.uuid4().hex[:6]}"
 
         # 5. classify the response — this is the LOOP part that completes
