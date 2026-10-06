@@ -63,7 +63,7 @@ class PromptDecorator(Protocol):
 
 
 def _normalize(text: str) -> str:
-    """Collapse whitespace so dedupe/contains checks are robust."""
+    """Collapse whitespace so dedupe and containment checks are consistent."""
     return re.sub(r"\s+", " ", text).strip()
 
 
